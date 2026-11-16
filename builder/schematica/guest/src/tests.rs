@@ -1,5 +1,16 @@
 use super::*;
 
+#[test]
+fn looking_from_inside_a_ghost_starts_at_the_next_voxel() {
+    let mut crossed = Vec::new();
+    let chosen = next_guide_cell([0.1, 0.5, 0.5], [1.0, 0.0, 0.0], 6., |cell| {
+        crossed.push(cell);
+        cell == [2, 0, 0]
+    });
+    assert_eq!(chosen, Some([2, 0, 0]));
+    assert_eq!(crossed, [[1, 0, 0], [2, 0, 0]]);
+}
+
 pub(super) fn reference_viewer() -> Viewer {
     let entries = [
         ("minecraft:oak_planks", 104),
@@ -41,6 +52,7 @@ pub(super) fn reference_viewer() -> Viewer {
             assist: false,
             fast_place: true,
             correct_aim: false,
+            strict_place: false,
             remember_placement: false,
             saved_placements: BTreeMap::new(),
             fullscreen_ui: true,
@@ -104,6 +116,7 @@ fn menu_edits_turn_the_guide_and_select_layer_ranges() {
             assist: false,
             fast_place: false,
             correct_aim: false,
+            strict_place: false,
             remember_placement: false,
             saved_placements: BTreeMap::new(),
             fullscreen_ui: true,

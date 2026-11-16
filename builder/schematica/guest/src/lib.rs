@@ -11,6 +11,7 @@ mod library;
 mod menu;
 mod native_bindings;
 mod overlay;
+mod paste;
 mod status;
 
 // Embed the revision in the guest itself so the importer labels the code it actually packages.
@@ -51,7 +52,7 @@ mod saved_placements;
 
 thread_local! {
     static RUNTIME: RefCell<(Runtime, Vec<&'static [u8]>, Options, Option<usize>)> =
-        const { RefCell::new((Runtime::Start, Vec::new(), Options { textured: true, assist: false, fast_place: false, correct_aim: false, fullscreen_ui: true, bridge_place: true, opacity: 65, hotkeys: BTreeMap::new(), library_revision: 0, deleted_entries: Vec::new(), remember_placement: false, saved_placements: BTreeMap::new() }, None)) };
+        const { RefCell::new((Runtime::Start, Vec::new(), Options { textured: true, assist: false, fast_place: false, strict_place: false, correct_aim: false, fullscreen_ui: true, bridge_place: true, opacity: 65, hotkeys: BTreeMap::new(), library_revision: 0, deleted_entries: Vec::new(), remember_placement: false, saved_placements: BTreeMap::new() }, None)) };
 }
 
 #[derive(Clone)]
@@ -59,6 +60,7 @@ struct Options {
     textured: bool,
     assist: bool,
     fast_place: bool,
+    strict_place: bool,
     correct_aim: bool,
     fullscreen_ui: bool,
     bridge_place: bool,
@@ -77,6 +79,7 @@ impl Options {
             &serde_json::json!({
                 "textured":self.textured, "assist":self.assist, "fast_place": self.fast_place,
                 "correct_aim": self.correct_aim,
+                "strict_place": self.strict_place,
                 "fullscreen_ui": self.fullscreen_ui, "bridge_place": self.bridge_place,
                 "remember_placement": self.remember_placement, "saved_placements": self.saved_placements,
                 "opacity": self.opacity, "hotkeys": self.hotkeys,
@@ -114,6 +117,7 @@ impl Guest for Schematica {
                 options.textured = value["textured"].as_bool().unwrap_or(options.textured);
                 options.assist = value["assist"].as_bool().unwrap_or(options.assist);
                 options.fast_place = value["fast_place"].as_bool().unwrap_or(options.fast_place);
+                options.strict_place = value["strict_place"].as_bool().unwrap_or(false);
                 options.correct_aim = value["correct_aim"]
                     .as_bool()
                     .unwrap_or(options.correct_aim);
@@ -333,6 +337,8 @@ struct Viewer {
     flip_z: bool,
     sort_name: bool,
     dirty: bool,
+    paste_confirm: bool,
+    paste: Option<paste::Paste>,
     last_label: String,
 }
 
@@ -381,6 +387,8 @@ impl Viewer {
             flip_z: true,
             sort_name: false,
             dirty: false,
+            paste_confirm: false,
+            paste: None,
             last_label: String::new(),
         }
     }
@@ -394,6 +402,8 @@ impl Viewer {
         if let Some(world) = world {
             let scope = (world.session, world.dimension);
             if self.world != Some(scope) {
+                self.paste = None;
+                self.paste_confirm = false;
                 let entering_from_world = self.world.is_some();
                 // Cinnabar invalidates drawing handles on dimension changes.
                 self.tiles.clear();
@@ -512,6 +522,10 @@ impl Viewer {
             self.menu_armed = false;
             return;
         }
+        self.paste_confirm = false;
+        if self.paste_step() {
+            return;
+        }
         let caps = drawing::capabilities();
         if !caps.contains(drawing::Permissions::WORLD_DRAW) {
             label("Schematica | Grant world_draw in Settings > Mods.");
@@ -557,22 +571,42 @@ impl Viewer {
             None
         };
         let native_cell = placement_cell.filter(|pos| self.planned_block(*pos).is_some());
-        let placement_cell =
-            if self.options.fast_place && self.options.correct_aim && self.options.bridge_place {
-                native_cell
-                    .filter(|pos| self.is_missing(*pos))
-                    .or_else(|| self.bridge_ghost())
-                    .or(native_cell)
-            } else {
-                native_cell
-            };
+        let eye_cell = self
+            .aim_ray()
+            .map(|(eye, _)| eye.map(|axis| axis.floor() as i32));
+        let inside_ghost = eye_cell
+            .is_some_and(|cell| self.planned_block(cell).is_some() && self.may_need_block(cell));
+        let placement_cell = if self.options.fast_place
+            && (self.options.strict_place || inside_ghost)
+        {
+            self.aimed_next_ghost()
+                .or_else(|| {
+                    native_cell.filter(|pos| Some(*pos) != eye_cell && self.may_need_block(*pos))
+                })
+                .or_else(|| {
+                    self.options
+                        .bridge_place
+                        .then(|| self.bridge_ghost())
+                        .flatten()
+                        .filter(|pos| Some(*pos) != eye_cell)
+                })
+        } else if self.options.fast_place && self.options.correct_aim && self.options.bridge_place {
+            native_cell
+                .filter(|pos| self.is_missing(*pos))
+                .or_else(|| self.bridge_ghost())
+                .or(native_cell)
+        } else {
+            native_cell
+        };
         if let Some(placement) = self.placement
             && let Some(pos @ [x, y, z]) = placement_cell
             && let Some(block) = self.planned_block(pos)
         {
             let block = placement.transform_state(block);
             let states = overlay::canonical(&block);
-            let offer = if self.options.correct_aim {
+            let offer = if self.options.strict_place {
+                item_use::offer_strict_placement((x, y, z), &block.name, &states)
+            } else if self.options.correct_aim || inside_ghost {
                 item_use::offer_oriented_placement((x, y, z), &block.name, &states)
             } else {
                 item_use::offer_creative_placement((x, y, z), &block.name, &states)
@@ -607,6 +641,14 @@ impl Viewer {
                 textured.then_some(f32::from(self.options.opacity) / 100.),
             ) {
                 self.cursor = (self.cursor + 1) % self.tiles.len();
+                let [width, height, depth] = self.schematic.size();
+                if self.layer_mode == 1
+                    && self.layer + 1 < height
+                    && overlay::layer_complete(&self.tiles, width, depth)
+                {
+                    self.layer += 1;
+                    self.dirty = true;
+                }
             }
         }
         if self.options.textured && !textured && self.placement.is_some() {
@@ -811,6 +853,21 @@ impl Viewer {
         self.tiles.iter().any(|tile| tile.is_missing(pos))
     }
 
+    fn may_need_block(&self, pos: [i32; 3]) -> bool {
+        use schematica_core::CellStatus;
+        matches!(
+            self.tiles.iter().find_map(|tile| tile.status_at(pos)),
+            None | Some(CellStatus::Missing | CellStatus::Unloaded)
+        )
+    }
+
+    fn aimed_next_ghost(&self) -> Option<[i32; 3]> {
+        let (eye, forward) = self.aim_ray()?;
+        next_guide_cell(eye, forward, 6., |cell| {
+            self.planned_block(cell).is_some() && self.may_need_block(cell)
+        })
+    }
+
     /// Finds the nearest missing guide cell within the crosshair's placement area.
     fn bridge_ghost(&self) -> Option<[i32; 3]> {
         let target = gameplay::read_block_target().ok().flatten();
@@ -909,6 +966,52 @@ impl Viewer {
             .extend(self.tiles.drain(..).filter(Tile::has_draws));
         self.clear_retired();
         self.retired.is_empty()
+    }
+}
+
+/// Walk voxel crossings after the camera cell. The host validates current terrain and reach.
+fn next_guide_cell(
+    eye: [f32; 3],
+    ray: [f32; 3],
+    reach: f32,
+    mut accepts: impl FnMut([i32; 3]) -> bool,
+) -> Option<[i32; 3]> {
+    let mut cell = eye.map(|value| value.floor() as i32);
+    let steps = ray.map(|value| {
+        if value > 0. {
+            1
+        } else if value < 0. {
+            -1
+        } else {
+            0
+        }
+    });
+    let delta = ray.map(|value| {
+        if value == 0. {
+            f32::INFINITY
+        } else {
+            1. / value.abs()
+        }
+    });
+    let mut next: [f32; 3] = std::array::from_fn(|axis| match steps[axis] {
+        1 => (cell[axis] as f32 + 1. - eye[axis]) * delta[axis],
+        -1 => (eye[axis] - cell[axis] as f32) * delta[axis],
+        _ => f32::INFINITY,
+    });
+    loop {
+        let crossing = next[0].min(next[1]).min(next[2]);
+        if !crossing.is_finite() || crossing > reach {
+            return None;
+        }
+        for axis in 0..3 {
+            if next[axis] == crossing {
+                cell[axis] += steps[axis];
+                next[axis] += delta[axis];
+            }
+        }
+        if accepts(cell) {
+            return Some(cell);
+        }
     }
 }
 

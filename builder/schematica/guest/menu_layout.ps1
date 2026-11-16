@@ -190,8 +190,9 @@ function Add-Dashboard {
         Add-Label "#materialCount$i" 562 $y 62 $accent 'right'
         Add-Node (New-Rect 254 ($y+12) 370 0.5 @(0.27,0.27,0.27,1))
     }
-    Add-Button 'settings' 'Settings' 254 332 182 19 $lightFill
-    Add-Button 'verifier' 'Verifier' 442 332 182 19 $lightFill
+    Add-Button 'settings' 'Settings' 254 332 120 19 $lightFill
+    Add-Button 'verifier' 'Verifier' 378 332 120 19 $lightFill
+    Add-Button 'paste' '#paste' 502 332 122 19 $lightFill
 }
 
 function Stretch-Node($node,$parentSize) {
@@ -310,6 +311,7 @@ foreach($screen in $Screens){
             Add-Label 'Menu layout' 24 229 200
             Add-Button 'ui-layout' '#ui-layout' 246 222 121 22
             Add-Button 'hotkeys' 'Keybinds' 16 252 84 22
+            Add-Button 'paste' '#paste' 109 252 130 22
             Add-Button 'close' 'Done' 296 252 84 22 $activeFill
         }
         'verifier' {

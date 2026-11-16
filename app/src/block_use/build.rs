@@ -15,6 +15,7 @@ pub(crate) struct BuildInput {
     pub clock: RepeatClock,
     view: LocalViewPose,
     pub(super) expected: Option<mod_host::CreativePlacementOffer>,
+    pub(super) air_place: bool,
 }
 
 /// A proposal freezes selection, placement and inventory effects before its first send.
@@ -54,23 +55,25 @@ impl BuildInput {
             clock,
             view,
             expected: None,
+            air_place: false,
         }
     }
 }
 
-/// Resolves the cauldron's item-form stack even when Bedrock advertises no block runtime ID.
+/// Resolves item-form stacks whose Bedrock placement lacks an advertised block runtime ID.
 pub(super) fn held_placement_block(
     collisions: &PhysicsCollisionRegistries,
     stream: &chunk_pipeline::WorldStream,
     block_id: i32,
-    is_cauldron: impl FnOnce() -> bool,
+    item_identifier: impl FnOnce() -> Option<std::sync::Arc<str>>,
 ) -> Option<u32> {
     held_block_store_id(stream, block_id).or_else(|| {
-        if is_cauldron() {
-            collisions.block_default_runtime_id(stream.network_id_mode(), "minecraft:cauldron")
-        } else {
-            None
-        }
+        let name = match item_identifier()?.as_ref() {
+            "minecraft:cauldron" => "minecraft:cauldron",
+            "minecraft:string" => "minecraft:trip_wire",
+            _ => return None,
+        };
+        collisions.block_default_runtime_id(stream.network_id_mode(), name)
     })
 }
 
@@ -149,7 +152,7 @@ fn prepare(
                 &context.collisions,
                 stream,
                 observed.selection.item.block_runtime_id(),
-                || identifier.as_deref() == Some("minecraft:cauldron"),
+                || identifier.clone(),
             )
         });
         let placement = (ready && caps.can_build && local_use != LocalUse::Interact)
@@ -182,6 +185,10 @@ fn prepare(
                 || !world.is_air(expected.position).ok()?
                 || placement.position != expected.position
                 || actual_name != Some(expected.name.as_str())
+                || (expected.strict_state
+                    && !actual_states.is_some_and(|actual| {
+                        super::orientation::strict_state_matches(expected, actual)
+                    }))
             {
                 let (yaw, pitch, _) = attempt.view.rotation().to_euler(bevy::math::EulerRot::YXZ);
                 bevy::log::info!(block = %expected.name, states = %expected.states, ghost = ?expected.position,
@@ -318,12 +325,15 @@ fn prepare(
         .0;
     let block_network_id = stream.block_network_id(observed.target.runtime_id)?;
     let legacy_request_id = protocol::next_legacy_request_id()?;
-    let change = (local_use == LocalUse::Place && game_mode != Some(PlayerGameMode::Creative))
-        .then(|| {
-            runtime
-                .inventory
-                .prepare_change(&observed.selection, legacy_request_id)
-        });
+    // For an air click the server owns both the block and the Survival inventory update.
+    let change = (!attempt.air_place
+        && local_use == LocalUse::Place
+        && game_mode != Some(PlayerGameMode::Creative))
+    .then(|| {
+        runtime
+            .inventory
+            .prepare_change(&observed.selection, legacy_request_id)
+    });
     attempt.observed = observed;
     Some(sim::CollisionQuery {
         identity,
@@ -402,9 +412,7 @@ pub(crate) fn advance(
     if !runtime.may_attempt(tick, plan.local_use, target, swings) {
         return false;
     }
-    let start_destination = runtime
-        .last_success_destination()
-        .is_none()
+    let start_destination = (!attempt.air_place && runtime.last_success_destination().is_none())
         .then_some(plan.destination);
     let mut before_swing = swings.clone();
     let packets = use_packets(
@@ -535,7 +543,7 @@ pub(crate) fn advance(
     }
     // Vanilla places locally as it sends; a correction replaces the prediction.
     if let (true, Some(cells), Some(stream)) = (
-        sent,
+        sent && !attempt.air_place,
         plan.predicted.as_ref(),
         context.client_world.stream.as_mut(),
     ) {
