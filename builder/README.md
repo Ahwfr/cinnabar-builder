@@ -18,6 +18,20 @@ You can also open **Build Builder.cmd** in the `builder` folder. When the build 
 For a verified portable build, extract the whole ZIP and open **Cinnabar Builder.exe** at its root. The first launch prepares Minecraft assets. Keep **profile/** when extracting updates into the same folder. The launcher upgrades an existing schematic library and backs up its previous component. See [the portable guide](PORTABLE-README.md). The new maintainer repository has no hosted build configured yet.
 Builder Windows saves Cargo's compiled dependencies and incremental compiler data between runs. A feature or fix can reuse work from the previous successful build. Cargo checks which inputs changed and recompiles what the new executable needs. The first run with a new cache or Rust toolchain has more work to do. The workflow builds the runtime and schematic importer and publishes a complete ZIP.
 
+## Build and launch on Linux
+
+Install the packages in the [platform guide](../docs/PORTING.md#linux) and `zenity`
+or `kdialog` for the schematic file picker. Then run:
+
+```sh
+builder/build-builder.sh
+builder/start-builder.sh
+```
+
+The profile lives in `.local/builder-user`, as on Windows. Use
+`builder/start-builder.sh --import-only --demo` or pass schematic files after
+`--import-only` to install a library from the terminal.
+
 ## Import a schematic
 
 Experimental bridging uses **Fast Place**, **Auto Orientation** and **Bridge
