@@ -225,21 +225,20 @@ pub(super) fn try_start(
             &context.collisions,
             stream,
             stack.block_runtime_id,
-            || {
-                stream
-                    .authority()
-                    .item_identifier(stack.network_id)
-                    .as_deref()
-                    == Some("minecraft:cauldron")
-            },
+            || stream.authority().item_identifier(stack.network_id),
         )?;
         (context.collisions.block_identifier(mode, block)? == offer.name.as_str()).then(|| {
             context.collisions.block_canonical_state(mode, block) == Some(offer.states.as_str())
         })
     };
     let selected = observed.selection.slot;
+    let use_air = offer.strict_state
+        && bridge
+        && observed.target.runtime_id == stream.air_block_id()
+        && observed.target.position == offer.position;
     if observed.target.face > 5
-        || placement_cell(observed.target.position, observed.target.face) != offer.position
+        || (!use_air
+            && placement_cell(observed.target.position, observed.target.face) != offer.position)
     {
         bevy::log::info!(
             ghost = ?offer.position,
@@ -527,7 +526,12 @@ pub(super) fn resume(
         );
         return true;
     };
-    if pending.aim.is_none() && support(&observed) != pending.support {
+    if pending.aim.is_none()
+        && support(&observed) != pending.support
+        && (!pending.offer.correct_aim
+            || placement_cell(observed.target.position, observed.target.face)
+                != pending.offer.position)
+    {
         movement.end_placement_facing();
         bevy::log::info!(block = %pending.offer.name, "Fast Place support changed before placement");
         return true;
@@ -592,11 +596,14 @@ pub(super) fn resume(
     } else {
         observed
     };
+    let use_air = observed.target.position == pending.offer.position
+        && observed.target.runtime_id == stream.air_block_id();
     runtime.forget_press_resolution();
     runtime.selection_changed(&observed.selection);
     let clock = RepeatClock::for_state(context.time.elapsed(), &state, Some(pending.game_mode));
     let mut build =
         build::BuildInput::new(observed, state, pending.trigger, clock.now, clock, view);
+    build.air_place = pending.bridge && pending.offer.strict_state && use_air;
     build.expected = Some(pending.offer);
     bevy::log::debug!(
         slot = pending.slot,

@@ -95,7 +95,7 @@ mod tests {
         assert_eq!(created["request_id"], "builder");
         assert_eq!(created["mods"][0]["enabled"], true);
 
-        let legacy = serde_json::json!({"version":2,"mods":[{"component":"/old/schematica-builder.wasm","enabled":false,"grants":{"commands":["x"],"hud":true},"reload":3}]});
+        let legacy = serde_json::json!({"version":2,"mods":[{"component":"/old/schematica-builder.wasm","enabled":false,"grants":{"commands":["say","fill","setblock"],"hud":true},"reload":3}]});
         let repaired = registered(Some(legacy), installed)?;
         assert_eq!(repaired["request_id"], "builder");
         assert_eq!(repaired["mods"].as_array().map(Vec::len), Some(1));
@@ -104,7 +104,10 @@ mod tests {
             installed.to_str().unwrap()
         );
         assert_eq!(repaired["mods"][0]["enabled"], false);
-        assert!(repaired["mods"][0]["grants"].get("commands").is_none());
+        assert_eq!(
+            repaired["mods"][0]["grants"]["commands"],
+            serde_json::json!(["fill", "setblock"])
+        );
 
         let kept = serde_json::json!({"version":2,"request_id":"settings-7","mods":[]});
         assert_eq!(
@@ -152,13 +155,36 @@ pub fn import_dialog(mods: &Path) -> Result<()> {
     let Some(inputs) = super::picker::choose()? else {
         return Ok(());
     };
-    let staged = mods.with_file_name(format!(".schematica-import-{}.wasm", std::process::id()));
-    super::write_library(&inputs, &staged, false)?;
-    let bytes = fs::read(&staged)?;
-    publish(mods, &bytes)?;
-    fs::remove_file(&staged)?;
+    append_imports(mods, &inputs)?;
     println!("SCHEMATICA_IMPORTED");
     Ok(())
+}
+
+pub fn append_imports(mods: &Path, inputs: &[PathBuf]) -> Result<()> {
+    let installed = mods.join("schematica-builder.wasm");
+    let payload = if installed.is_file() {
+        let file = fs::File::open(&installed)?;
+        use std::io::Read as _;
+        let mut existing = Vec::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut existing)?;
+        ensure!(
+            existing.len() <= 4 * 1024 * 1024,
+            "installed schematic component is too large"
+        );
+        library_payload(&existing)?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<_> = blueprint::library(&payload)
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+    // Preserve existing indices and their saved placements and deletion preferences.
+    let revision = blueprint::library_revision(&payload);
+    super::add_inputs(&mut entries, inputs)?;
+    let bytes = super::encode_component(&template()?, &entries, revision)?;
+    publish(mods, &bytes)
 }
 
 /// Where one build keeps the client, its working folder, guest template and build stamp.
@@ -278,8 +304,14 @@ fn registered(document: Option<serde_json::Value>, installed: &Path) -> Result<s
     }) {
         entry["component"] = serde_json::json!(installed);
         if let Some(grants) = entry["grants"].as_object_mut() {
-            for capability in ["commands", "wasi", "packets", "packet_delay"] {
+            for capability in ["wasi", "packets", "packet_delay"] {
                 grants.remove(capability);
+            }
+            if let Some(commands) = grants
+                .get_mut("commands")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                commands.retain(|name| matches!(name.as_str(), Some("setblock" | "fill")));
             }
         }
     } else {

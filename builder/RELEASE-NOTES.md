@@ -1,4 +1,24 @@
-# Cinnabar Builder 0.3.8
+# Cinnabar Builder 0.3.11
+
+- V2 Strict can attempt to fill an empty schematic cell within reach when there is no usable support face. It reports the actual air runtime ID in a normal block-placement transaction. Bedrock confirms the block and Survival inventory update.
+- Verified a direct air placement on stock Bedrock 1.26.60.6 in Survival with cheats disabled. Also verified opposite stair facings. Upside-down stairs, upper slabs and horizontal pillars use real support because the direct air click cannot be relied on to preserve the placement face. Server acceptance can vary.
+
+## 0.3.10
+
+- Put Paste build on the main schematic screen and in Settings.
+- Both Fast Place modes look past the ghost enclosing the camera. Direct targeting can start before the preview finishes scanning.
+- Auto Orientation checks the planned stair or slab half first, tries a yaw-only correction before searching for another face, and can use an alternate valid support after inventory selection.
+
+## 0.3.9
+
+- In-game imports add files to the current library and preserve its existing entries and placement settings.
+- Fast Place cycles through Off, V1 Classic and V2 Strict. V2 aims beyond the ghost containing the eye and requires the predicted stair or slab half and orientation to match.
+- Fast Place recognizes string as the item for the Bedrock tripwire block.
+- Large guides use larger tiles to display more of the build at once. A Cardiff-sized guide fits within the retained tile budget.
+- Single Layer mode advances after every required block on the current layer has been verified.
+- Paste build uses the server's block commands in Creative when operator cheats are available. It requires the `setblock` and `fill` mod permissions and preserves occupied cells.
+
+## 0.3.8
 
 - Import larger schematics through the in-game picker. Blueprints can contain up to 100,000 cells, with the original file and decompression limits still in effect.
 - Show cyan outlines on textured ghosts. Large builds show the nearby part of the guide as you move around it.

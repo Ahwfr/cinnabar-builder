@@ -51,7 +51,10 @@ pub(super) fn correction(
 ) -> Option<PlacementAim> {
     if expected.states == "{}"
         || expected.name.ends_with("_wall")
-        || expected.name == "minecraft:cauldron"
+        || matches!(
+            expected.name.as_str(),
+            "minecraft:cauldron" | "minecraft:trip_wire"
+        )
         || context.input.movement() != [0.0; 2]
         || state.displacement[0].abs() > 0.01
         || state.displacement[2].abs() > 0.01
@@ -88,13 +91,22 @@ pub(super) fn correction(
         serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&expected.states)
             .ok()?;
     let stair = planned.contains_key("weirdo_direction");
+    let planned_upper = planned_upper(&planned);
     let matches = |candidate: &FrozenBlockObservation, view: LocalViewPose| {
-        if stair {
-            let on_half_boundary =
-                candidate.target.face >= 2 && (candidate.target.relative_hit[1] - 0.5).abs() < 0.01;
-            if on_half_boundary || !stable_stair_yaw(view.rotation()) {
+        if let Some(want_upper) = planned_upper {
+            let [_, y, _] = candidate.target.relative_hit;
+            let upper = match candidate.target.face {
+                0 => true,
+                1 => false,
+                _ if (y - 0.5).abs() > 0.01 => y > 0.5,
+                _ => return false,
+            };
+            if upper != want_upper {
                 return false;
             }
+        }
+        if stair && !stable_stair_yaw(view.rotation()) {
+            return false;
         }
         let surroundings =
             use_surroundings(context, &world, candidate, state.position, state.sneaking);
@@ -127,11 +139,37 @@ pub(super) fn correction(
                     .is_some_and(|actual| matches_planned_state(&planned, actual))
         })
     };
-    if !bridge && matches(observed, *context.view) {
-        return None;
-    }
     let eye = Vec3::from_array(observed.ray.origin);
     let forward = Vec3::from_array(observed.ray.direction).try_normalize()?;
+    let mut view = *context.view;
+    if matches(observed, view) {
+        return bridge.then(|| {
+            PlacementAim::observed(
+                view.rotation(),
+                (
+                    observed.target.position,
+                    observed.target.face,
+                    observed.target.runtime_id,
+                ),
+                forward,
+            )
+        });
+    }
+    // Changing yaw alone is cheaper and more stable than finding a different support ray.
+    if let Some(rotation) = separate_facing(view.rotation(), |rotation| {
+        view.set_rotation(rotation);
+        matches(observed, view)
+    }) {
+        return Some(PlacementAim::observed(
+            rotation,
+            (
+                observed.target.position,
+                observed.target.face,
+                observed.target.runtime_id,
+            ),
+            forward,
+        ));
+    }
     let mut best = None;
     let mut best_dot = f32::NEG_INFINITY;
     let mut separate = None;
@@ -206,7 +244,7 @@ pub(super) fn correction(
         }
     }
     best.or(separate).or_else(|| {
-        if bridge {
+        if bridge || expected.strict_state {
             for face in 0..6 {
                 for height in [0.25, 0.75, 0.5] {
                     let Some(hit) = hidden_support_hit_at(&world, expected.position, face, height)
@@ -243,24 +281,7 @@ pub(super) fn correction(
                 }
             }
         }
-        let mut view = *context.view;
-        let rotation = if matches(observed, view) {
-            view.rotation()
-        } else {
-            separate_facing(view.rotation(), |rotation| {
-                view.set_rotation(rotation);
-                matches(observed, view)
-            })?
-        };
-        Some(PlacementAim::observed(
-            rotation,
-            (
-                observed.target.position,
-                observed.target.face,
-                observed.target.runtime_id,
-            ),
-            forward,
-        ))
+        None
     })
 }
 
@@ -281,6 +302,38 @@ fn separate_facing(rotation: Quat, mut matches: impl FnMut(Quat) -> bool) -> Opt
         .find(|&candidate| matches(candidate))
 }
 
+/// Direct air clicks preserve reported yaw, but Bedrock can ignore the click face.
+pub(super) fn air_place_preserves_state(offer: &CreativePlacementOffer) -> bool {
+    let Ok(planned) =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&offer.states)
+    else {
+        return false;
+    };
+    planned_upper(&planned) != Some(true)
+        && !matches!(
+            planned
+                .get("pillar_axis")
+                .and_then(|state| state["value"].as_str()),
+            Some("x" | "z")
+        )
+}
+
+fn planned_upper(planned: &serde_json::Map<String, serde_json::Value>) -> Option<bool> {
+    planned
+        .get("upside_down_bit")
+        .and_then(|property| property["value"].as_u64())
+        .map(|value| value == 1)
+        .or_else(|| {
+            planned.get("minecraft:vertical_half").and_then(|property| {
+                match property["value"].as_str()? {
+                    "top" => Some(true),
+                    "bottom" => Some(false),
+                    _ => None,
+                }
+            })
+        })
+}
+
 /// Imported schematics can omit properties which Bedrock derives from neighbors.
 fn matches_planned_state(
     planned: &serde_json::Map<String, serde_json::Value>,
@@ -293,6 +346,27 @@ fn matches_planned_state(
     planned
         .iter()
         .all(|(name, value)| name == "minecraft:corner" || actual.get(name) == Some(value))
+}
+
+pub(super) fn strict_state_matches(offer: &CreativePlacementOffer, actual: &str) -> bool {
+    let Ok(mut planned) =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&offer.states)
+    else {
+        return false;
+    };
+    let wall = offer.name.ends_with("_wall");
+    let pane = offer.name.ends_with("glass_pane") || offer.name == "minecraft:iron_bars";
+    let wire = offer.name == "minecraft:trip_wire";
+    planned.retain(|key, _| {
+        !((wall && (key == "wall_post_bit" || key.starts_with("wall_connection_type_")))
+            || ((pane || wire) && key.starts_with("minecraft:connection_"))
+            || (wire
+                && matches!(
+                    key.as_str(),
+                    "attached_bit" | "powered_bit" | "suspended_bit"
+                )))
+    });
+    matches_planned_state(&planned, actual)
 }
 
 /// Recasts the saved support ray from the current eye before submitting the click.
