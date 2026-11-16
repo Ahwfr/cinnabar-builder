@@ -12,9 +12,11 @@ Builder welcomes fixes and platform ports under the inherited noncommercial term
 
 Get the setup EXE or portable ZIP from [Builder releases](https://github.com/Ahwfr/cinnabar-builder/releases)
 and open **Cinnabar Builder.exe**. To build from source, install Rust (rustup), Go, GNU Make
-and Git for Windows, then from the checkout run:
+and Git for Windows, then get the code and build it:
 
 ```powershell
+git clone https://github.com/Ahwfr/cinnabar-builder.git
+cd cinnabar-builder
 .\builder\Build-Builder.ps1
 .\builder\Start-Builder.ps1
 ```
@@ -31,9 +33,12 @@ picker. On Debian or Ubuntu:
 sudo apt install build-essential libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev zenity
 ```
 
-Then commit or stash any local changes and run from the checkout:
+Then get the code and build it. The build script needs a clean checkout, so commit or stash
+any local changes before rebuilding.
 
 ```sh
+git clone https://github.com/Ahwfr/cinnabar-builder.git
+cd cinnabar-builder
 builder/build-builder.sh
 builder/start-builder.sh
 ```
