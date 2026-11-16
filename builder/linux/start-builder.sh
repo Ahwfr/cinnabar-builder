@@ -2,8 +2,8 @@
 # Starts the Builder client with its isolated profile in .local/builder-user.
 # The importer installs or upgrades the Schematica library and enables it before launch.
 #
-# Usage: builder/start-builder.sh [--profile debug|release|play] [--check]
-#        builder/start-builder.sh --import-only [--demo] [FILE...]
+# Usage: builder/linux/start-builder.sh [--profile debug|release|play] [--check]
+#        builder/linux/start-builder.sh --import-only [--demo] [FILE...]
 set -euo pipefail
 
 profile=release
@@ -24,7 +24,7 @@ while (($#)); do
 done
 case $profile in debug | release | play) ;; *) echo "Choose --profile debug, release or play." >&2; exit 2 ;; esac
 
-checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 profile_dir=$checkout/target/$profile
 user_root=${CINNABAR_USER_ROOT:-$checkout/.local/builder-user}
 stamp=$profile_dir/builder-commit.txt
@@ -53,7 +53,7 @@ if ((check)); then
     exit 0
 fi
 
-((importer_ready)) || { echo "Build the importer with builder/build-builder.sh --importer-only first." >&2; exit 1; }
+((importer_ready)) || { echo "Build the importer with builder/linux/build-builder.sh --importer-only first." >&2; exit 1; }
 
 if ((import_only)); then
     mods=$user_root/data/mods
@@ -76,5 +76,5 @@ if ((import_only)); then
     exit 0
 fi
 
-((built)) || { echo "Build this revision with builder/build-builder.sh before launching." >&2; exit 1; }
+((built)) || { echo "Build this revision with builder/linux/build-builder.sh before launching." >&2; exit 1; }
 CINNABAR_USER_ROOT=$user_root exec "$codec" start-checkout "$checkout" "$profile"

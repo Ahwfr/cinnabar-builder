@@ -14,8 +14,8 @@ upstream Ubuntu CI: libwayland-dev, libxkbcommon-dev, libasound2-dev and
 libudev-dev. The file picker needs `zenity` or `kdialog`. Then run:
 
 ```sh
-builder/build-builder.sh
-builder/start-builder.sh
+builder/linux/build-builder.sh
+builder/linux/start-builder.sh
 ```
 
 `start-builder.sh --check` reports the build state and file picker,

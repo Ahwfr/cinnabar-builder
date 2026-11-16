@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the Builder client, Go core, schematic importer and guest for this revision.
-# Usage: builder/build-builder.sh [--profile dev|release|play] [--importer-only]
+# Usage: builder/linux/build-builder.sh [--profile dev|release|play] [--importer-only]
 set -euo pipefail
 
 profile=release
@@ -14,7 +14,7 @@ while (($#)); do
 done
 case $profile in dev | release | play) ;; *) echo "Choose --profile dev, release or play." >&2; exit 2 ;; esac
 
-checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 tools=(cargo rustup)
 ((importer_only)) || tools+=(go make)
 missing=()
@@ -51,4 +51,4 @@ for file in cinnabar bedrock-core; do
     [[ -f target/$profile_dir/$file ]] || { echo "The upstream build did not produce $file." >&2; exit 1; }
 done
 echo "$commit" >"$stamp"
-echo "Built Cinnabar Builder $commit. Start it with builder/start-builder.sh."
+echo "Built Cinnabar Builder $commit. Start it with builder/linux/start-builder.sh."
