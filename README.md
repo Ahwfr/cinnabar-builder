@@ -6,8 +6,47 @@ and [maintainer setup](CONTRIBUTING.md). The [platform guide](docs/PORTING.md) d
 what has been verified and the Linux work. The [distribution review](docs/DISTRIBUTION.md)
 records licensing and release requirements.
 
-Get the Windows setup EXE or portable ZIP from [Builder releases](https://github.com/Ahwfr/cinnabar-builder/releases).
 Builder welcomes fixes and platform ports under the inherited noncommercial terms.
+
+## Install on Windows
+
+Get the setup EXE or portable ZIP from [Builder releases](https://github.com/Ahwfr/cinnabar-builder/releases)
+and open **Cinnabar Builder.exe**. To build from source, install Rust (rustup), Go, GNU Make
+and Git for Windows, then from the checkout run:
+
+```powershell
+.\builder\Build-Builder.ps1
+.\builder\Start-Builder.ps1
+```
+
+You can also open **Build Builder.cmd** and then **Play Builder.cmd** in the `builder` folder.
+
+## Install on Linux
+
+There is no packaged Linux release yet; build from source. Install Rust (rustup), Go, Make,
+Git and the development packages, plus `zenity` (or `kdialog` on KDE) for the schematic file
+picker. On Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential libwayland-dev libxkbcommon-dev libasound2-dev libudev-dev zenity
+```
+
+Then commit or stash any local changes and run from the checkout:
+
+```sh
+builder/build-builder.sh
+builder/start-builder.sh
+```
+
+`builder/start-builder.sh --check` reports what is built and which file picker was found.
+
+## Using Builder
+
+The launcher installs the Schematica library and enables it in its own profile,
+`.local/builder-user` in a source checkout. In a world, press **M** for the Schematica menu,
+**Alt+J** for the library and **Alt+K** for its settings. **Import schematic…** opens the
+file picker for `.schematic`, `.schem`, `.litematic` and `.mcstructure` files. See the
+[Builder guide](builder/README.md) for placement, Fast Place and updates.
 
 The upstream Cinnabar description below provides context. Its downloads are upstream
 builds. The Builder work is maintained separately.
