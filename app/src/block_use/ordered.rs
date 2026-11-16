@@ -1,0 +1,192 @@
+//! Per-edge build admission; held repeats remain in the frame maintenance system.
+
+use super::*;
+use bevy::prelude::In;
+
+/// Attempts this edge once, returning whether item use may resolve its air-use suffix.
+pub(crate) fn press(
+    In(input): In<crate::ordered_interactions::InteractionInput>,
+    mut player: ResMut<client_state::PlayerRuntime>,
+    mut context: BlockUseContext,
+    mut runtime: ResMut<BlockUseRuntime>,
+    mut swings: ResMut<SwingTracker>,
+    mut item_use: ResMut<client_interaction::item_use::ItemUseRuntime>,
+    mut movement: ResMut<MovementTicker>,
+) -> bool {
+    let pressed = input.edge.pressed;
+    let now = u64::try_from(context.time.elapsed().as_millis()).unwrap_or(u64::MAX);
+    runtime.synchronize(movement.interaction_authority_identity());
+    if pressed {
+        runtime.forget_press_resolution();
+    }
+    let resolved = (|| {
+        if (runtime.stopping() || runtime.last_success_destination().is_some())
+            && !stop_block_use(&mut runtime, &context, pressed)
+        {
+            return false;
+        }
+        if !pressed || context.melee.blocks_use_at(now) {
+            return true;
+        }
+        if !movement.accepts_block_interactions()
+            || movement.has_held_release()
+            || movement.between_ticks_sample().is_none()
+        {
+            return false;
+        }
+        let Some(selection) = verified_use_selection(&player, &context.ui) else {
+            bevy::log::debug!("Fast Place trace: use press has no admitted hand selection");
+            return false;
+        };
+        runtime.selection_changed(&selection);
+        runtime.observe_use(input.edge.buttons.held(Action::Use), true, false, true);
+        let (Some(state), Some(pick)) = (movement.build_action_state(), runtime.pick(&movement))
+        else {
+            return false;
+        };
+        let game_mode = player.facts.player_game_mode();
+        let Some(caps) = player.facts.game_mode_capabilities() else {
+            return false;
+        };
+        if !caps.can_use_blocks() {
+            return true;
+        }
+        let clock = RepeatClock::for_state(context.time.elapsed(), &state, game_mode);
+        let mode = protocol_input_mode(input.context.mode);
+        if let Some(mut actor) = actor_use::prepare(
+            &context,
+            &input.context.origin,
+            &selection,
+            &player,
+            pick,
+            &state,
+            mode,
+            clock.now,
+            clock,
+        ) {
+            return actor_use::advance(&context, &mut runtime, &mut actor);
+        }
+        let observed = observe_use_target(
+            &player,
+            &context,
+            &input.context.origin,
+            mode,
+            clock.survival,
+            input.context.identity,
+            movement.position_authority_identity().1,
+            &runtime,
+            Some(pick),
+            ItemUseTrigger::PlayerInput,
+            &state,
+        );
+        let on_planned_face = observed.as_ref().is_some_and(|hit| {
+            context
+                .creative
+                .as_ref()
+                .and_then(|policy| policy.offer.as_ref())
+                .is_some_and(|offer| {
+                    placement_cell(hit.target.position, hit.target.face) == offer.position
+                })
+        });
+        if !on_planned_face
+            && let Some(bridge) = super::target::observe_bridge_target(
+                &player,
+                &context,
+                &input.context.origin,
+                mode,
+                input.context.identity,
+                movement.position_authority_identity().1,
+                &state,
+            )
+            && creative::try_start(
+                &mut player,
+                &mut context,
+                &bridge,
+                &mut movement,
+                true,
+                ItemUseTrigger::PlayerInput,
+            )
+        {
+            creative::resume(
+                &mut player,
+                &mut context,
+                &mut runtime,
+                &mut item_use,
+                &mut swings,
+                &mut movement,
+                Some(pick),
+                input.edge.buttons.held(Action::Use),
+                mode,
+                input.context.identity,
+            );
+            return false;
+        }
+        let Some(observed) = observed else {
+            bevy::log::debug!("Fast Place trace: use press has no native support hit");
+            creative::clear(context.creative.as_deref_mut(), &mut player, &mut movement);
+            runtime.record(
+                ItemUseTrigger::PlayerInput,
+                clock.now,
+                state.tick.saturating_add(1),
+                LocalUse::Nothing,
+                false,
+                clock,
+            );
+            return true;
+        };
+        if creative::try_start(
+            &mut player,
+            &mut context,
+            &observed,
+            &mut movement,
+            false,
+            ItemUseTrigger::PlayerInput,
+        ) {
+            creative::resume(
+                &mut player,
+                &mut context,
+                &mut runtime,
+                &mut item_use,
+                &mut swings,
+                &mut movement,
+                Some(pick),
+                input.edge.buttons.held(Action::Use),
+                mode,
+                input.context.identity,
+            );
+            return false;
+        }
+        let mut build = build::BuildInput::new(
+            observed,
+            state,
+            ItemUseTrigger::PlayerInput,
+            clock.now,
+            clock,
+            input.context.view,
+        );
+        build::advance(
+            &mut player,
+            &mut context,
+            &mut runtime,
+            &mut item_use,
+            &mut swings,
+            &mut movement,
+            &mut build,
+        )
+    })();
+    runtime.clear_press();
+    resolved
+}
+
+/// Keeps an accepted block stop before the next action, including an attacking interruption.
+pub(crate) fn fence(
+    In(attack): In<bool>,
+    mut runtime: ResMut<BlockUseRuntime>,
+    context: BlockUseContext,
+) -> bool {
+    if runtime.stopping() || (attack && runtime.last_success_destination().is_some()) {
+        stop_block_use(&mut runtime, &context, false)
+    } else {
+        true
+    }
+}
