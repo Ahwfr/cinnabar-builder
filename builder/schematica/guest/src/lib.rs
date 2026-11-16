@@ -1,0 +1,954 @@
+wit_bindgen::generate!({
+    path: "wit",
+    world: "cinnabar:extension/extension@0.1.0",
+    generate_all,
+});
+
+mod actions;
+mod dashboard;
+mod hotkeys;
+mod library;
+mod menu;
+mod native_bindings;
+mod overlay;
+mod status;
+
+// Embed the revision in the guest itself so the importer labels the code it actually packages.
+#[cfg(target_arch = "wasm32")]
+const BUILD_REVISION: &str = match option_env!("SCHEMATICA_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "",
+};
+
+#[cfg(target_arch = "wasm32")]
+#[used]
+#[unsafe(link_section = "schematica:build-revision")]
+static GUEST_REVISION: [u8; BUILD_REVISION.len()] = {
+    let mut bytes = [0; BUILD_REVISION.len()];
+    bytes.copy_from_slice(BUILD_REVISION.as_bytes());
+    bytes
+};
+
+#[cfg(target_arch = "wasm32")]
+#[used]
+#[unsafe(link_section = "schematica:build-version")]
+static GUEST_VERSION: [u8; env!("CARGO_PKG_VERSION").len()] = {
+    let mut bytes = [0; env!("CARGO_PKG_VERSION").len()];
+    bytes.copy_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+    bytes
+};
+
+use cinnabar::{
+    extension::{budget, gameplay, hud, input, item_use, panel, settings, terrain},
+    world_draw::drawing,
+};
+use menu::Screen;
+use overlay::{Preview, Tile};
+use schematica_core::{LayerMode, MaterialLine, Mirror, Placement, Schematic, blueprint};
+use std::{cell::RefCell, collections::BTreeMap, f32::consts::TAU};
+
+mod saved_placements;
+
+thread_local! {
+    static RUNTIME: RefCell<(Runtime, Vec<&'static [u8]>, Options, Option<usize>)> =
+        const { RefCell::new((Runtime::Start, Vec::new(), Options { textured: true, assist: false, fast_place: false, correct_aim: false, fullscreen_ui: true, bridge_place: true, opacity: 65, hotkeys: BTreeMap::new(), library_revision: 0, deleted_entries: Vec::new(), remember_placement: false, saved_placements: BTreeMap::new() }, None)) };
+}
+
+#[derive(Clone)]
+struct Options {
+    textured: bool,
+    assist: bool,
+    fast_place: bool,
+    correct_aim: bool,
+    fullscreen_ui: bool,
+    bridge_place: bool,
+    opacity: u8,
+    hotkeys: BTreeMap<usize, String>,
+    library_revision: u64,
+    deleted_entries: Vec<usize>,
+    remember_placement: bool,
+    saved_placements: BTreeMap<String, serde_json::Value>,
+}
+
+impl Options {
+    fn save(&self) {
+        #[cfg(not(test))]
+        let _ = settings::save(
+            &serde_json::json!({
+                "textured":self.textured, "assist":self.assist, "fast_place": self.fast_place,
+                "correct_aim": self.correct_aim,
+                "fullscreen_ui": self.fullscreen_ui, "bridge_place": self.bridge_place,
+                "remember_placement": self.remember_placement, "saved_placements": self.saved_placements,
+                "opacity": self.opacity, "hotkeys": self.hotkeys,
+                "library_revision": self.library_revision, "deleted_entries": self.deleted_entries,
+            })
+            .to_string(),
+        );
+    }
+}
+
+enum Runtime {
+    Start,
+    Loading(blueprint::Decoder<'static>),
+    Counting {
+        schematic: Schematic,
+        counts: Vec<u64>,
+        totals: BTreeMap<String, u64>,
+        cursor: usize,
+    },
+    Finishing(Schematic, BTreeMap<String, u64>),
+    Ready(Viewer),
+    Invalid,
+}
+
+struct Schematica;
+
+impl Guest for Schematica {
+    fn init() {
+        if let Ok(raw) = settings::load()
+            && raw.len() <= 16 * 1024
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            RUNTIME.with(|state| {
+                let options = &mut state.borrow_mut().2;
+                options.textured = value["textured"].as_bool().unwrap_or(options.textured);
+                options.assist = value["assist"].as_bool().unwrap_or(options.assist);
+                options.fast_place = value["fast_place"].as_bool().unwrap_or(options.fast_place);
+                options.correct_aim = value["correct_aim"]
+                    .as_bool()
+                    .unwrap_or(options.correct_aim);
+                options.fullscreen_ui = value["fullscreen_ui"].as_bool().unwrap_or(true);
+                options.bridge_place = value["bridge_place"].as_bool().unwrap_or(true);
+                options.remember_placement = value["remember_placement"].as_bool().unwrap_or(false);
+                options.saved_placements = saved_placements::load(&value["saved_placements"]);
+                options.library_revision = value["library_revision"].as_u64().unwrap_or(0);
+                options.deleted_entries = value["deleted_entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.as_u64())
+                    .filter(|index| *index < blueprint::MAX_LIBRARY as u64)
+                    .map(|index| index as usize)
+                    .take(blueprint::MAX_LIBRARY)
+                    .collect();
+                if let Some(opacity) = value["opacity"].as_u64() {
+                    options.opacity = opacity.clamp(25, 90) as u8;
+                }
+                if let Some(bindings) = value["hotkeys"].as_object() {
+                    for (index, value) in bindings {
+                        if let (Ok(index), Some(value)) = (index.parse(), value.as_str()) {
+                            hotkeys::edit(&mut options.hotkeys, index, value);
+                        }
+                    }
+                }
+            });
+        }
+        RUNTIME.with(|runtime| label(&runtime.borrow().2.menu_hint("Schematica")));
+    }
+
+    fn frame() {
+        RUNTIME.with(|runtime| {
+            let (runtime, catalog, options, active_entry) = &mut *runtime.borrow_mut();
+            if matches!(*runtime, Runtime::Start) {
+                static SLOT: [u8; blueprint::SLOT_BYTES] = blueprint::empty_slot();
+                let bytes = std::hint::black_box(&SLOT).as_slice();
+                let bytes = blueprint::embedded_payload(bytes).unwrap_or_default();
+                match blueprint::library(bytes) {
+                    Ok(entries) => {
+                        options.select_library(blueprint::library_revision(bytes));
+                        *catalog = entries;
+                        *runtime = Runtime::Ready(Viewer::new(
+                            Schematic::new("No schematic loaded", [1; 3]),
+                            Vec::new(),
+                            library_names(catalog),
+                            options.clone(),
+                            false,
+                        ));
+                    }
+                    Err(_) => invalidate(runtime),
+                }
+            }
+            match &mut *runtime {
+                Runtime::Ready(viewer) => {
+                    if let Some(index) = viewer.request {
+                        if viewer.release_for_switch() {
+                            *options = viewer.options.clone();
+                            *active_entry = Some(index);
+                            match blueprint::Decoder::new(catalog[index]) {
+                                Ok(decoder) => *runtime = Runtime::Loading(decoder),
+                                Err(_) => invalidate(runtime),
+                            }
+                        }
+                    } else {
+                        viewer.frame();
+                    }
+                }
+                Runtime::Loading(decoder) => {
+                    for _ in 0..8 {
+                        if budget::remaining_fuel() < 500_000 {
+                            break;
+                        }
+                        match decoder.step() {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                let Runtime::Loading(decoder) =
+                                    std::mem::replace(&mut *runtime, Runtime::Invalid)
+                                else {
+                                    unreachable!()
+                                };
+                                match decoder.finish() {
+                                    Ok((schematic, counts)) => {
+                                        *runtime = Runtime::Counting {
+                                            schematic,
+                                            counts,
+                                            totals: BTreeMap::new(),
+                                            cursor: 0,
+                                        };
+                                    }
+                                    Err(_) => invalidate(runtime),
+                                }
+                                break;
+                            }
+                            Err(_) => {
+                                invalidate(runtime);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Runtime::Counting {
+                    schematic,
+                    counts,
+                    totals,
+                    cursor,
+                } => {
+                    let stop = (*cursor + 8).min(counts.len());
+                    while *cursor < stop && budget::remaining_fuel() >= 500_000 {
+                        let state = &schematic.palette()[*cursor];
+                        let count = counts[*cursor];
+                        if count > 0 && !state.is_air() {
+                            *totals.entry(state.name.clone()).or_insert(0) += count;
+                        }
+                        *cursor += 1;
+                    }
+                    if *cursor == counts.len() {
+                        let Runtime::Counting {
+                            schematic, totals, ..
+                        } = std::mem::replace(&mut *runtime, Runtime::Invalid)
+                        else {
+                            unreachable!()
+                        };
+                        *runtime = Runtime::Finishing(schematic, totals);
+                    }
+                }
+                Runtime::Finishing(..) => {
+                    let Runtime::Finishing(schematic, totals) =
+                        std::mem::replace(&mut *runtime, Runtime::Invalid)
+                    else {
+                        unreachable!()
+                    };
+                    let mut materials: Vec<_> = totals
+                        .into_iter()
+                        .map(|(name, total)| MaterialLine {
+                            name,
+                            total,
+                            missing: total,
+                        })
+                        .collect();
+                    materials.sort_by_key(|line| std::cmp::Reverse(line.total));
+                    let mut viewer = Viewer::new(
+                        schematic,
+                        materials,
+                        library_names(catalog),
+                        options.clone(),
+                        true,
+                    );
+                    viewer.active_entry = *active_entry;
+                    *runtime = Runtime::Ready(viewer);
+                    label(&options.menu_hint("Schematica"));
+                }
+                Runtime::Invalid => {}
+                Runtime::Start => unreachable!(),
+            }
+        });
+    }
+}
+
+fn library_names(catalog: &[&[u8]]) -> Vec<String> {
+    catalog
+        .iter()
+        .map(|entry| blueprint::title(entry).unwrap_or_else(|_| "Invalid schematic".into()))
+        .collect()
+}
+
+fn invalidate(runtime: &mut Runtime) {
+    *runtime = Runtime::Invalid;
+    label("Schematica | Build the component with a valid embedded blueprint.");
+}
+
+export!(Schematica);
+
+fn label(message: &str) {
+    let mut end = message.len().min(256);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let _ = hud::set_label(&message[..end]);
+}
+
+struct Viewer {
+    schematic: Schematic,
+    materials: Vec<schematica_core::MaterialLine>,
+    placement: Option<Placement>,
+    world: Option<(u64, i32)>,
+    placement_key: Option<String>,
+    pose: Option<gameplay::Snapshot>,
+    tile_focus: Option<[i32; 3]>,
+    preview: Preview,
+    tiles: Vec<Tile>,
+    retired: Vec<Tile>,
+    cursor: usize,
+    layer: i32,
+    layer_mode: u8,
+    shown: bool,
+    render_all: bool,
+    locked: bool,
+    menu_armed: bool,
+    pending_menu_open: u8,
+    options: Options,
+    material_page: usize,
+    material_offset: usize,
+    verifier_page: usize,
+    verifier_marker: Option<overlay::DrawPair>,
+    verifier_target: Option<[i32; 3]>,
+    verifier_marker_changed: bool,
+    screen: Screen,
+    library: Vec<String>,
+    selected: Option<usize>,
+    active_entry: Option<usize>,
+    request: Option<usize>,
+    loaded: bool,
+    auto_place: bool,
+    rotate_ccw: bool,
+    flip_z: bool,
+    sort_name: bool,
+    dirty: bool,
+    last_label: String,
+}
+
+impl Viewer {
+    fn new(
+        schematic: Schematic,
+        materials: Vec<MaterialLine>,
+        library: Vec<String>,
+        options: Options,
+        loaded: bool,
+    ) -> Self {
+        Self {
+            schematic,
+            materials,
+            placement: None,
+            world: None,
+            placement_key: None,
+            pose: None,
+            tile_focus: None,
+            preview: Preview::default(),
+            tiles: Vec::new(),
+            retired: Vec::new(),
+            cursor: 0,
+            layer: 0,
+            layer_mode: 0,
+            shown: true,
+            render_all: true,
+            locked: false,
+            menu_armed: false,
+            pending_menu_open: 0,
+            options,
+            material_page: 0,
+            material_offset: 0,
+            verifier_page: 0,
+            verifier_marker: None,
+            verifier_target: None,
+            verifier_marker_changed: false,
+            screen: Screen::Main,
+            library,
+            selected: None,
+            active_entry: None,
+            request: None,
+            loaded,
+            auto_place: loaded,
+            rotate_ccw: false,
+            flip_z: true,
+            sort_name: false,
+            dirty: false,
+            last_label: String::new(),
+        }
+    }
+
+    fn frame(&mut self) {
+        let Ok(world) = gameplay::read_frame() else {
+            label("Schematica | Grant terrain access in Settings > Mods.");
+            return;
+        };
+        let active_world = world.is_some();
+        if let Some(world) = world {
+            let scope = (world.session, world.dimension);
+            if self.world != Some(scope) {
+                let entering_from_world = self.world.is_some();
+                // Cinnabar invalidates drawing handles on dimension changes.
+                self.tiles.clear();
+                self.retired.clear();
+                self.placement = None;
+                self.locked = false;
+                self.verifier_marker = None;
+                self.verifier_target = None;
+                self.verifier_marker_changed = false;
+                self.world = Some(scope);
+                self.placement_key = gameplay::read_local_world_key()
+                    .ok()
+                    .flatten()
+                    .map(|key| format!("{key:016x}/{}", scope.1));
+                self.restore_placement(entering_from_world);
+                self.last_label.clear();
+            }
+            self.pose = Some(world);
+        }
+
+        let Ok(keys) = input::read_controls() else {
+            label("Schematica | Grant controls access in Settings > Mods.");
+            return;
+        };
+        if !keys.focused {
+            self.menu_armed = false;
+            self.pending_menu_open = 0;
+            return;
+        }
+        if keys.panel_open || keys.keys_pressed.iter().any(|key| key == "Escape") {
+            self.pending_menu_open = 0;
+        }
+        if self.pending_menu_open > 0 {
+            self.pending_menu_open -= 1;
+            menu::request_open();
+            return;
+        }
+        native_bindings::sample();
+        let alt = keys
+            .keys_held
+            .iter()
+            .any(|key| key == "AltLeft" || key == "AltRight");
+        let legacy = alt
+            .then(|| {
+                keys.keys_pressed.iter().find_map(|key| match key.as_str() {
+                    "KeyJ" => Some(Screen::Load),
+                    "KeyI" => Some(Screen::Control),
+                    "KeyK" => Some(Screen::Settings),
+                    "KeyP" if !self.loaded => Some(Screen::Load),
+                    _ => None,
+                })
+            })
+            .flatten();
+        if keys.panel_open {
+            self.menu_armed = false;
+            let old = self.screen;
+            let mut changed = false;
+            if matches!(self.screen, Screen::Main | Screen::Load)
+                && keys.wheel != 0.
+                && let (Some((x, y)), Some(layout)) = (keys.pointer, panel::read_layout())
+            {
+                let x = (x - layout.offset.0) / layout.scale * 640. / layout.width;
+                let y = (y - layout.offset.1) / layout.scale * 360. / layout.height;
+                if (254. ..=624.).contains(&x) && (245. ..332.).contains(&y) {
+                    changed |= self.scroll_materials(-keys.wheel.signum() as isize);
+                }
+            }
+            if self.screen == Screen::Control {
+                for edit in input::read_text_events().unwrap_or_default() {
+                    changed |= self.edit_number(&edit.id, &edit.value);
+                }
+            }
+            if self.screen == Screen::Hotkeys {
+                for edit in input::read_text_events().unwrap_or_default() {
+                    if let Some(index) =
+                        edit.id.strip_prefix("bind-").and_then(|id| id.parse().ok())
+                    {
+                        hotkeys::edit(&mut self.options.hotkeys, index, &edit.value);
+                        self.options.save();
+                        changed = true;
+                    }
+                }
+            }
+            for event in keys.events {
+                self.menu_action(&event.id);
+                changed = true;
+            }
+            if changed && self.dirty {
+                self.remember_placement();
+            }
+            if self.request.is_some() {
+                let _ = panel::close();
+                return;
+            }
+            if old != self.screen {
+                menu::prepare(self);
+            } else if changed {
+                menu::refresh(self);
+            }
+            return;
+        }
+        let gameplay = active_world && keys.gameplay;
+        // Opening a panel needs focused input, not a current placement snapshot.
+        // The host withholds key edges while another screen owns input.
+        if let Some(screen) = legacy.or_else(|| self.builder_hotkey(&keys, alt, gameplay)) {
+            self.screen = screen;
+            self.selected = None;
+            self.verifier_page = 0;
+            self.material_page = 0;
+            if menu::prepare(self) {
+                self.pending_menu_open = 4;
+            }
+            return;
+        }
+        if !gameplay {
+            self.menu_armed = false;
+            return;
+        }
+        let caps = drawing::capabilities();
+        if !caps.contains(drawing::Permissions::WORLD_DRAW) {
+            label("Schematica | Grant world_draw in Settings > Mods.");
+            return;
+        }
+
+        if alt {
+            for key in &keys.keys_pressed {
+                self.dirty |= self.control(key);
+            }
+        }
+        if alt && keys.keys_pressed.iter().any(|key| key == "KeyU") {
+            let message = self.aimed_block().map_or_else(
+                || "Schematica | Aim at a planned block".into(),
+                |(block, pos)| format!("Schematica | {} at {pos:?}", block.name),
+            );
+            label(&message);
+            return;
+        }
+        if self.auto_place {
+            self.auto_place = false;
+            self.dirty |= self.control("KeyP");
+        }
+        if self.dirty {
+            self.remember_placement();
+            self.rebuild();
+            self.dirty = false;
+            return;
+        }
+        self.update_preview_window();
+        if std::mem::take(&mut self.verifier_marker_changed) {
+            self.clear_verifier_marker();
+            if let Some(cell) = self.verifier_target {
+                self.verifier_marker = overlay::highlight(self.world.unwrap().1, cell).ok();
+            }
+        }
+        let placement_cell = if self.options.fast_place && self.shown && self.placement.is_some() {
+            item_use::read_placement_cell()
+                .ok()
+                .flatten()
+                .map(|(x, y, z)| [x, y, z])
+        } else {
+            None
+        };
+        let native_cell = placement_cell.filter(|pos| self.planned_block(*pos).is_some());
+        let placement_cell =
+            if self.options.fast_place && self.options.correct_aim && self.options.bridge_place {
+                native_cell
+                    .filter(|pos| self.is_missing(*pos))
+                    .or_else(|| self.bridge_ghost())
+                    .or(native_cell)
+            } else {
+                native_cell
+            };
+        if let Some(placement) = self.placement
+            && let Some(pos @ [x, y, z]) = placement_cell
+            && let Some(block) = self.planned_block(pos)
+        {
+            let block = placement.transform_state(block);
+            let states = overlay::canonical(&block);
+            let offer = if self.options.correct_aim {
+                item_use::offer_oriented_placement((x, y, z), &block.name, &states)
+            } else {
+                item_use::offer_creative_placement((x, y, z), &block.name, &states)
+            };
+            if let Err(error) = offer {
+                self.show_label(&format!("Fast Place | {error}"));
+                return;
+            }
+        }
+        if !self.retired.is_empty() {
+            // A tile owns up to four handles. Stay under the host's 32 drawing
+            // calls per callback even when moving or hiding a large guide.
+            self.clear_retired();
+            self.publish_label(placement_cell);
+            return;
+        }
+        if !self.tiles.is_empty() && !self.preview.palette_ready(&self.schematic) {
+            self.preview.prepare(&self.schematic);
+            return;
+        }
+        if budget::remaining_fuel() < 650_000 {
+            return;
+        }
+        let textured =
+            self.options.textured && caps.contains(drawing::Permissions::RENDER_MATERIAL);
+        if self.shown && !self.tiles.is_empty() {
+            let tile = &mut self.tiles[self.cursor];
+            if tile.step(
+                &self.preview,
+                &self.schematic,
+                self.world.unwrap().1,
+                textured.then_some(f32::from(self.options.opacity) / 100.),
+            ) {
+                self.cursor = (self.cursor + 1) % self.tiles.len();
+            }
+        }
+        if self.options.textured && !textured && self.placement.is_some() {
+            self.show_label("Schematica | Textures need render_material");
+        } else {
+            self.publish_label(placement_cell);
+        }
+    }
+
+    /// Resolve chords before opening the main menu on release of a standalone M.
+    fn builder_hotkey(
+        &mut self,
+        keys: &input::Controls,
+        alt: bool,
+        gameplay: bool,
+    ) -> Option<Screen> {
+        let modified = alt
+            || ["Control", "Shift", "Super"]
+                .iter()
+                .any(|modifier| keys.keys_held.iter().any(|key| key.starts_with(modifier)));
+        if modified {
+            self.menu_armed = false;
+            return None;
+        }
+        use hotkeys::Action;
+        match native_bindings::action(keys, &mut self.menu_armed)? {
+            Action::Main => return Some(Screen::Main),
+            Action::Config => return Some(Screen::Settings),
+            Action::Placement | Action::PlacementConfig => return Some(Screen::Control),
+            Action::Verifier => return Some(Screen::Verifier),
+            Action::Materials => return Some(Screen::Materials),
+            _ if !gameplay => return None,
+            Action::Render => {
+                self.render_all = !self.render_all;
+                self.dirty = true;
+                self.last_label.clear();
+                if !self.render_all {
+                    label("");
+                }
+            }
+            Action::Ghosts => self.dirty |= self.control("KeyB"),
+            Action::NextMode => self.dirty |= self.control("KeyL"),
+            Action::PreviousMode => {
+                self.layer_mode = (self.layer_mode + 2) % 3;
+                self.dirty = true;
+            }
+            Action::NextLayer => self.dirty |= self.control("BracketRight"),
+            Action::PreviousLayer => self.dirty |= self.control("BracketLeft"),
+        }
+        None
+    }
+
+    fn control(&mut self, key: &str) -> bool {
+        match key {
+            "KeyP" => {
+                if !self.loaded || self.locked {
+                    return false;
+                }
+                let Some(frame) = &self.pose else {
+                    return false;
+                };
+                let yaw = frame.yaw.rem_euclid(TAU);
+                let [width, _, depth] = self.placement.map_or(self.schematic.size(), |p| {
+                    p.footprint(self.schematic.size())
+                });
+                let distance = (width.max(depth) as f32 / 2. + 3.).min(36.);
+                let origin = [
+                    (frame.eye.x - yaw.sin() * distance).floor() as i32 - width / 2,
+                    (frame.eye.y - 1.62).round() as i32,
+                    (frame.eye.z - yaw.cos() * distance).floor() as i32 - depth / 2,
+                ];
+                self.placement
+                    .get_or_insert_with(|| Placement::new(origin))
+                    .origin = origin;
+                self.shown = true;
+            }
+            "KeyH" => self.shown = !self.shown,
+            "KeyB" => {
+                self.options.textured = !self.options.textured;
+                self.options.save();
+            }
+            "KeyL" => self.layer_mode = (self.layer_mode + 1) % 3,
+            "BracketLeft" => {
+                if self.layer_mode == 0 {
+                    self.layer_mode = 1;
+                }
+                self.layer = (self.layer - 1).max(0);
+            }
+            "BracketRight" => {
+                if self.layer_mode == 0 {
+                    self.layer_mode = 1;
+                }
+                self.layer = (self.layer + 1).min(self.schematic.size()[1] - 1);
+            }
+            _ => {
+                if self.locked {
+                    return false;
+                }
+                let Some(p) = &mut self.placement else {
+                    return false;
+                };
+                match key {
+                    "KeyR" => p.rotate_cw(),
+                    "RotateLeft" => p.rotate_ccw(),
+                    "KeyM" => {
+                        p.mirror = match p.mirror {
+                            Mirror::None => Mirror::X,
+                            Mirror::X => Mirror::Z,
+                            Mirror::Z => Mirror::None,
+                        }
+                    }
+                    "ArrowLeft" => p.origin[0] -= 1,
+                    "ArrowRight" => p.origin[0] += 1,
+                    "ArrowUp" => p.origin[2] -= 1,
+                    "ArrowDown" => p.origin[2] += 1,
+                    "PageUp" => p.origin[1] += 1,
+                    "PageDown" => p.origin[1] -= 1,
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    fn move_here(&mut self) -> bool {
+        if !self.loaded || self.locked {
+            return false;
+        }
+        let Some(pose) = &self.pose else { return false };
+        let placement = self.placement.get_or_insert_with(|| Placement::new([0; 3]));
+        let [width, _, depth] = placement.footprint(self.schematic.size());
+        let quadrant = ((180. - pose.yaw.to_degrees()) / 90.).floor() as i32 & 3;
+        let (dx, dz) = [(-width, 1), (-width, -depth), (1, -depth), (1, 1)][quadrant as usize];
+        placement.origin = [
+            pose.eye.x.floor() as i32 + dx,
+            (pose.eye.y - 1.62).round() as i32,
+            pose.eye.z.floor() as i32 + dz,
+        ];
+        self.shown = true;
+        true
+    }
+
+    fn edit_number(&mut self, id: &str, text: &str) -> bool {
+        if let Ok(value) = text.trim().parse::<i32>() {
+            if id == "layer" {
+                self.layer = value.clamp(0, self.schematic.size()[1] - 1);
+                if self.layer_mode == 0 {
+                    self.layer_mode = 1;
+                }
+                self.dirty = true;
+            } else if !self.locked
+                && let (Some(p), Some(axis)) = (
+                    &mut self.placement,
+                    ["x", "y", "z"].iter().position(|name| *name == id),
+                )
+            {
+                p.origin[axis] = value.clamp(-30_000_000, 30_000_000);
+                self.dirty = true;
+            }
+        }
+        // Repaint the accepted value even when the submitted text was invalid.
+        true
+    }
+
+    fn planned_block(&self, world: [i32; 3]) -> Option<&schematica_core::BlockState> {
+        if !self.shown {
+            return None;
+        }
+        let local = self
+            .placement?
+            .world_to_local(self.schematic.size(), world)?;
+        let block = self.schematic.get(local)?;
+        (self.layers().includes(local[1]) && !block.is_air()).then_some(block)
+    }
+
+    fn aim_ray(&self) -> Option<([f32; 3], [f32; 3])> {
+        let pose = self.pose.as_ref()?;
+        if !self.shown || self.placement.is_none() {
+            return None;
+        }
+        let forward = [
+            -pose.yaw.sin() * pose.pitch.cos(),
+            pose.pitch.sin(),
+            -pose.yaw.cos() * pose.pitch.cos(),
+        ];
+        Some(([pose.eye.x, pose.eye.y, pose.eye.z], forward))
+    }
+
+    fn aimed_block(&self) -> Option<(&schematica_core::BlockState, [i32; 3])> {
+        let (eye, forward) = self.aim_ray()?;
+        for step in 0..=80 {
+            let world =
+                [0, 1, 2].map(|i| (eye[i] + forward[i] * (step as f32 / 16.)).floor() as i32);
+            if let Some(block) = self.planned_block(world) {
+                return Some((block, world));
+            }
+        }
+        None
+    }
+
+    fn is_missing(&self, pos: [i32; 3]) -> bool {
+        self.tiles.iter().any(|tile| tile.is_missing(pos))
+    }
+
+    /// Finds the nearest missing guide cell within the crosshair's placement area.
+    fn bridge_ghost(&self) -> Option<[i32; 3]> {
+        let target = gameplay::read_block_target().ok().flatten();
+        if target.is_none()
+            && let Some((_, pos)) = self.aimed_block()
+            && self.is_missing(pos)
+        {
+            return Some(pos);
+        }
+        let (eye, forward) = self.aim_ray()?;
+        let support = target.map(|p| [p.x, p.y, p.z]);
+        nearby_ghost(eye, forward, support, |pos| {
+            self.planned_block(pos).is_some() && self.is_missing(pos)
+        })
+    }
+
+    fn layers(&self) -> LayerMode {
+        match self.layer_mode {
+            1 => LayerMode::Single(self.layer),
+            2 => LayerMode::Range {
+                min: 0,
+                max: self.layer,
+            },
+            _ => LayerMode::All,
+        }
+    }
+
+    fn layers_text(&self) -> String {
+        let height = self.schematic.size()[1];
+        match self.layers() {
+            LayerMode::All => format!("All {height} layers"),
+            LayerMode::Single(y) => format!("Layer {} of {height}", y + 1),
+            LayerMode::Range { min, max } => format!("Layers {}-{} of {height}", min + 1, max + 1),
+        }
+    }
+
+    fn rebuild(&mut self) {
+        self.clear_verifier_marker();
+        self.verifier_target = None;
+        self.verifier_marker_changed = false;
+        self.retired
+            .extend(self.tiles.drain(..).filter(Tile::has_draws));
+        self.cursor = 0;
+        if let Some(p) = self.placement.filter(|_| self.shown && self.render_all) {
+            self.preview = Preview::new(p, self.layers());
+            self.tile_focus = self.preview_focus();
+            self.tiles = self.preview.tiles(self.schematic.size(), self.tile_focus);
+        }
+    }
+
+    fn preview_focus(&self) -> Option<[i32; 3]> {
+        let eye = self.pose.as_ref().map_or_else(
+            || self.placement.unwrap().origin.map(|axis| axis as f32),
+            |pose| [pose.eye.x, pose.eye.y, pose.eye.z],
+        );
+        self.preview.focus(self.schematic.size(), eye)
+    }
+
+    fn update_preview_window(&mut self) {
+        if self.placement.is_none() || !self.shown || !self.render_all {
+            return;
+        }
+        let focus = self.preview_focus();
+        if focus == self.tile_focus {
+            return;
+        }
+        self.tile_focus = focus;
+        let mut previous: BTreeMap<_, _> = self
+            .tiles
+            .drain(..)
+            .map(|tile| (tile.origin(), tile))
+            .collect();
+        self.tiles = self
+            .preview
+            .tiles(self.schematic.size(), focus)
+            .into_iter()
+            .map(|tile| previous.remove(&tile.origin()).unwrap_or(tile))
+            .collect();
+        self.retired
+            .extend(previous.into_values().filter(Tile::has_draws));
+        self.cursor = 0;
+    }
+
+    fn clear_retired(&mut self) {
+        for _ in 0..6 {
+            let Some(mut tile) = self.retired.pop() else {
+                break;
+            };
+            tile.clear();
+        }
+    }
+
+    fn release_for_switch(&mut self) -> bool {
+        self.clear_verifier_marker();
+        self.retired
+            .extend(self.tiles.drain(..).filter(Tile::has_draws));
+        self.clear_retired();
+        self.retired.is_empty()
+    }
+}
+
+/// Searches a bounded corridor around the crosshair, ranked by distance to the ray.
+fn nearby_ghost(
+    eye: [f32; 3],
+    forward: [f32; 3],
+    support: Option<[f32; 3]>,
+    mut is_missing: impl FnMut([i32; 3]) -> bool,
+) -> Option<[i32; 3]> {
+    const CENTER_REACH: f32 = 6.2;
+    let mut best = None;
+    let desired_depth = support.map_or(0.0, |p| {
+        (0..3).map(|i| (p[i] - eye[i]) * forward[i]).sum::<f32>() + 1.0
+    });
+    let mut score = (25.0, f32::INFINITY);
+    let center = eye.map(|coord| coord.floor() as i32);
+    for x in -6..=6 {
+        for y in -6..=6 {
+            for z in -6..=6 {
+                let pos = [center[0] + x, center[1] + y, center[2] + z];
+                let delta = [0, 1, 2].map(|i| (f64::from(pos[i]) + 0.5 - f64::from(eye[i])) as f32);
+                let distance = delta.iter().map(|d| d * d).sum::<f32>();
+                let depth = (0..3).map(|i| delta[i] * forward[i]).sum::<f32>();
+                if depth < 0.0 || distance > CENTER_REACH * CENTER_REACH {
+                    continue;
+                }
+                let offset = (0..3)
+                    .map(|i| (delta[i] - depth * forward[i]).powi(2))
+                    .sum();
+                let candidate = (offset, (depth - desired_depth).abs());
+                if candidate < score && is_missing(pos) {
+                    score = candidate;
+                    best = Some(pos);
+                }
+            }
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests;

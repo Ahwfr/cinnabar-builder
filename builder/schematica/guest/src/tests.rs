@@ -1,0 +1,208 @@
+use super::*;
+
+pub(super) fn reference_viewer() -> Viewer {
+    let entries = [
+        ("minecraft:oak_planks", 104),
+        ("minecraft:cobblestone", 49),
+        ("minecraft:oak_log", 12),
+        ("minecraft:glass_pane", 4),
+        ("minecraft:wooden_door", 1),
+        ("minecraft:torch", 1),
+    ];
+    let mut schematic = Schematic::new("Lakeside Cabin", [7, 5, 7]);
+    let mut cursor = 0;
+    for (name, count) in entries {
+        for _ in 0..count {
+            schematic.set(
+                [cursor % 7, cursor / 49, (cursor / 7) % 7],
+                schematica_core::BlockState::new(name),
+            );
+            cursor += 1;
+        }
+    }
+    let materials = entries
+        .into_iter()
+        .map(|(name, total)| MaterialLine {
+            name: name.into(),
+            total: total as u64,
+            missing: total as u64,
+        })
+        .collect();
+    let mut viewer = Viewer::new(
+        schematic,
+        materials,
+        vec![
+            "Lakeside Cabin".into(),
+            "Sugar Cane Farm".into(),
+            "Passenger Wagon".into(),
+        ],
+        Options {
+            textured: true,
+            assist: false,
+            fast_place: true,
+            correct_aim: false,
+            remember_placement: false,
+            saved_placements: BTreeMap::new(),
+            fullscreen_ui: true,
+            bridge_place: true,
+            opacity: 65,
+            hotkeys: BTreeMap::new(),
+            library_revision: 0,
+            deleted_entries: Vec::new(),
+        },
+        true,
+    );
+    let mut placement = Placement::new([120, 64, -48]);
+    placement.quarter_turns = 1;
+    viewer.placement = Some(placement);
+    viewer.active_entry = Some(0);
+    viewer
+}
+
+#[test]
+fn dashboard_reports_the_current_schematic_and_unload_state() {
+    let mut viewer = reference_viewer();
+    let mut out = serde_json::Map::new();
+    dashboard::bindings(&viewer, &mut out);
+    assert_eq!(out["#detailBlocks"], serde_json::json!("171"));
+    assert_eq!(out["#materialCount0"], serde_json::json!("104"));
+    assert_eq!(out["#active0"], serde_json::json!(true));
+    assert_eq!(out["#active1"], serde_json::json!(false));
+    viewer.menu_action("unload-0");
+    dashboard::bindings(&viewer, &mut out);
+    assert_eq!(out["#hasBlueprint"], serde_json::json!(false));
+    assert!(viewer.placement.is_none());
+}
+
+#[test]
+fn deleting_compacts_the_library_and_reimport_restores_entries() {
+    let mut viewer = reference_viewer();
+    viewer.menu_action("delete-0");
+    assert!(!viewer.loaded);
+    assert!(viewer.placement.is_none());
+    assert_eq!(viewer.visible_entry(0), Some(1));
+    viewer.menu_action("select-0");
+    assert_eq!(viewer.request, Some(1));
+    let mut out = serde_json::Map::new();
+    dashboard::bindings(&viewer, &mut out);
+    assert_eq!(out["#file0"], "Sugar Cane Farm");
+    viewer.options.select_library(0);
+    assert_eq!(viewer.options.deleted_entries, vec![0]);
+    viewer.options.select_library(1);
+    assert!(viewer.options.deleted_entries.is_empty());
+    assert_eq!(viewer.library[0], "Lakeside Cabin");
+}
+
+#[test]
+fn menu_edits_turn_the_guide_and_select_layer_ranges() {
+    let mut viewer = Viewer::new(
+        Schematic::new("fixture", [2, 4, 3]),
+        Vec::new(),
+        vec!["Demo".into(), "Wagon".into()],
+        Options {
+            textured: true,
+            assist: false,
+            fast_place: false,
+            correct_aim: false,
+            remember_placement: false,
+            saved_placements: BTreeMap::new(),
+            fullscreen_ui: true,
+            bridge_place: true,
+            opacity: 65,
+            hotkeys: BTreeMap::new(),
+            library_revision: 0,
+            deleted_entries: Vec::new(),
+        },
+        true,
+    );
+    viewer.placement = Some(Placement::new([12, 64, -5]));
+    assert!(viewer.options.textured);
+    viewer.menu_action("select-1");
+    viewer.menu_action("select-8");
+    assert_eq!(viewer.selected, Some(1));
+
+    viewer.menu_action("ccw");
+    let placement = viewer.placement.unwrap();
+    assert_eq!(placement.quarter_turns, 3);
+    assert_eq!(placement.footprint(viewer.schematic.size()), [3, 4, 2]);
+    assert!(viewer.dirty);
+    viewer.menu_action("cw");
+    assert_eq!(viewer.placement.unwrap().quarter_turns, 0);
+
+    viewer.menu_action("mode");
+    viewer.menu_action("next-layer");
+    assert_eq!(viewer.layers(), LayerMode::Single(1));
+    viewer.menu_action("mode");
+    assert_eq!(viewer.layers(), LayerMode::Range { min: 0, max: 1 });
+    viewer.menu_action("mode");
+    assert_eq!(viewer.layers(), LayerMode::All);
+}
+#[test]
+fn dashboard_transform_controls_move_and_mirror_the_active_placement() {
+    let mut viewer = reference_viewer();
+    let start = viewer.placement.unwrap().origin;
+    for id in ["x-plus", "y-plus", "z-plus"] {
+        viewer.menu_action(id);
+    }
+    assert_eq!(viewer.placement.unwrap().origin, start.map(|n| n + 1));
+    for id in ["x-minus", "y-minus", "z-minus"] {
+        viewer.menu_action(id);
+    }
+    assert_eq!(viewer.placement.unwrap().origin, start);
+    for expected in [Mirror::X, Mirror::Z, Mirror::None] {
+        viewer.menu_action("mirror-cycle");
+        assert_eq!(viewer.placement.unwrap().mirror, expected);
+    }
+    viewer.locked = true;
+    viewer.menu_action("x-plus");
+    viewer.menu_action("mirror-cycle");
+    assert_eq!(viewer.placement.unwrap().origin, start);
+    assert_eq!(viewer.placement.unwrap().mirror, Mirror::None);
+}
+
+#[test]
+fn dashboard_can_scroll_to_the_last_material() {
+    let mut viewer = reference_viewer();
+    let mut bindings = serde_json::Map::new();
+    viewer.menu_action("materials-down");
+    crate::dashboard::bindings(&viewer, &mut bindings);
+    assert_eq!(viewer.material_offset, 1);
+    assert_eq!(bindings["#materialName4"], "torch");
+    assert_eq!(bindings["#materialsDown"], false);
+    viewer.menu_action("materials-up");
+    assert_eq!(viewer.material_offset, 0);
+}
+
+#[test]
+fn bridge_finds_a_ghost_one_block_off_the_crosshair() {
+    let eye = [0.5, 64.5, 0.0];
+    let forward = [0.0, 0.0, 1.0];
+    let near = [1, 64, 3];
+    let far = [5, 64, 1];
+    assert_eq!(
+        super::nearby_ghost(eye, forward, None, |pos| pos == near || pos == far),
+        Some(near)
+    );
+    assert_eq!(
+        super::nearby_ghost(eye, forward, None, |pos| pos == far),
+        Some(far)
+    );
+    assert_eq!(
+        super::nearby_ghost(eye, forward, None, |pos| pos == [6, 64, 1]
+            || pos == [0, 64, -1]),
+        None
+    );
+}
+
+#[test]
+fn bridge_uses_the_far_side_of_the_aimed_support_in_both_depth_directions() {
+    for (eye, forward, ghost) in [
+        ([0.5, 64.5, 0.5], [0.0, 0.0, 1.0], [0, 64, 4]),
+        ([0.5, 64.5, 6.5], [0.0, 0.0, -1.0], [0, 64, 2]),
+    ] {
+        let selected = super::nearby_ghost(eye, forward, Some([0.5, 64.5, 3.5]), |pos| {
+            pos == [0, 64, 2] || pos == [0, 64, 4]
+        });
+        assert_eq!(selected, Some(ghost));
+    }
+}
