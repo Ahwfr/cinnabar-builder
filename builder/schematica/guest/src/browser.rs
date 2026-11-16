@@ -54,7 +54,8 @@ impl Tab {
 }
 
 /// The Settings tab's switches: option key and title. Controls are named `bw-set-<key>`.
-const SETTINGS: [(&str, &str); 8] = [
+const SETTINGS: [(&str, &str); 9] = [
+    ("hold-place", "Hold to place"),
     ("look", "Textured ghost blocks"),
     ("assist", "Target info"),
     ("remember-placement", "Remember positions"),
@@ -707,57 +708,68 @@ mod layout {
     }
 
     /// One Controls row: the action and its key in a small chip.
-    fn key_row(action: &str, key: &str, offset: [f64; 2], width: f64) -> Value {
-        const CHIP: f64 = 64.;
-        let items = vec![
-            named(
-                "action",
-                text(action, [width - CHIP - 8., 10.], [0., 6.], TEXT, "left"),
-            ),
-            named("chip", framed([CHIP, 18.], [width - CHIP, 2.], FIELD)),
-            named(
-                "key",
-                text(key, [CHIP, 10.], [width - CHIP, 6.], TEXT, "center"),
-            ),
-        ];
-        anchored(
-            json!({"type":"panel","controls":items}),
-            [width, 22.],
-            offset,
-        )
-    }
-
-    /// Controls: every hotkey and the key bound to it, in two columns.
-    fn keys() -> Vec<Value> {
+    fn keys(controls: &mut Controls) -> Vec<Value> {
         let mut nodes = heading("bw_keys");
-        let column = (WIDTH - 24.) / 2.;
-        let rows: Vec<(String, String)> =
-            std::iter::once(("Open this window".to_owned(), "P".to_owned()))
-                .chain(
-                    crate::hotkeys::BINDINGS
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (_, title, _))| {
-                            ((*title).to_owned(), format!("#bw_key{index}"))
-                        }),
-                )
-                .collect();
-        let per_column = rows.len().div_ceil(2);
-        for (index, (action, key)) in rows.iter().enumerate() {
-            let x = PAD + (index / per_column) as f64 * (column + 24.);
-            let y = STRIP + 40. + 28. * (index % per_column) as f64;
-            nodes.push(named(
-                format!("key{index}"),
-                key_row(action, key, [x, y], column),
-            ));
-            if index % per_column > 0 {
+        let rows = [
+            [
+                ("place", "Place here"),
+                ("ccw", "Rotate left"),
+                ("cw", "Rotate right"),
+            ],
+            [("x-minus", "X −"), ("y-minus", "Y −"), ("z-minus", "Z −")],
+            [("x-plus", "X +"), ("y-plus", "Y +"), ("z-plus", "Z +")],
+            [
+                ("previous-layer", "Previous layer"),
+                ("mode", "Layer mode"),
+                ("next-layer", "Next layer"),
+            ],
+            [
+                ("mirror", "Mirror"),
+                ("lock", "#bw_lock"),
+                ("visibility", "#bw_visibility"),
+            ],
+            [
+                ("verifier", "Verifier"),
+                ("paste", "#bw_paste"),
+                ("hotkeys", "Hotkeys"),
+            ],
+        ];
+        let width = (WIDTH - 16.) / 3.;
+        for (row, commands) in rows.into_iter().enumerate() {
+            for (col, (id, title)) in commands.into_iter().enumerate() {
+                let size = [width, 24.];
+                let offset = [
+                    PAD + col as f64 * (width + 8.),
+                    STRIP + 40. + row as f64 * 30.,
+                ];
+                let index = controls.button(id);
+                let click = json!({
+                    "type": "button", "size": size,
+                    "default_control": "idle", "hover_control": "hover",
+                    "pressed_control": "pressed",
+                    "button_mappings": [{"from_button_id":"button.menu_select",
+                        "to_button_id":format!("mod.control:{index}"), "mapping_type":"pressed"}],
+                    "controls": [
+                        {"idle": {"type":"panel", "size":size}},
+                        {"hover": rect(size, [0., 0.], [1., 1., 1., 0.08], RADIUS)},
+                        {"pressed": rect(size, [0., 0.], [0., 0., 0., 0.25], RADIUS)},
+                    ]
+                });
                 nodes.push(named(
-                    format!("key_rule{index}"),
-                    rect([column, 1.], [x, y - 3.], LINE, 0.),
+                    id,
+                    anchored(
+                        json!({"type":"panel", "controls":[
+                            {"face": framed(size, [0., 0.], BUTTON)},
+                            {"caption": text(title, [width,10.], [0.,7.], TEXT, "center")},
+                            {"click": click},
+                        ]}),
+                        size,
+                        offset,
+                    ),
                 ));
             }
         }
-        nodes.push(footer("Change hotkeys from the M menu  ·  P to close"));
+        nodes.push(footer("P closes this window"));
         nodes
     }
 
@@ -769,7 +781,7 @@ mod layout {
         card.push(named("materials", body(0, materials(&mut controls))));
         card.push(named("import", body(1, import(&mut controls))));
         card.push(named("settings", body(2, settings(&mut controls))));
-        card.push(named("controls", body(3, keys())));
+        card.push(named("controls", body(3, keys(&mut controls))));
         let document = json!({
             "namespace": "browser",
             "root": {"type":"screen","size":["100%","100%"],"controls":[
@@ -879,6 +891,7 @@ impl Viewer {
             "remember-placement" => options.remember_placement,
             "paste-destroy" => options.paste_destroy,
             "fast-place" => options.fast_place,
+            "hold-place" => options.hold_place,
             "correct-aim" => options.correct_aim,
             "bridge-place" => options.bridge_place,
             "auto-layer" => options.auto_layer,
@@ -1064,17 +1077,42 @@ fn import(viewer: &Viewer, out: &mut Map<String, Value>) {
 }
 
 fn keys(viewer: &Viewer, out: &mut Map<String, Value>) {
-    out.insert("#bw_keys_title".into(), json!("Controls"));
+    out.insert("#bw_keys_title".into(), json!("Hologram controls"));
     out.insert(
         "#bw_keys_summary".into(),
-        json!("Hotkeys for the schematic guide"),
+        json!(viewer.placement.map_or_else(
+            || "Load a schematic to adjust its placement".into(),
+            |p| format!(
+                "{} {} {}  ·  {}°  ·  {:?}  ·  {}",
+                p.origin[0],
+                p.origin[1],
+                p.origin[2],
+                p.quarter_turns * 90,
+                p.mirror,
+                viewer.layers_text()
+            ),
+        )),
     );
-    for index in 0..crate::hotkeys::BINDINGS.len() {
-        out.insert(
-            format!("#bw_key{index}"),
-            json!(crate::hotkeys::binding(&viewer.options.hotkeys, index)),
-        );
-    }
+    out.insert(
+        "#bw_lock".into(),
+        json!(if viewer.locked { "Unlock" } else { "Lock" }),
+    );
+    out.insert(
+        "#bw_visibility".into(),
+        json!(if viewer.shown {
+            "Hide guide"
+        } else {
+            "Show guide"
+        }),
+    );
+    out.insert(
+        "#bw_paste".into(),
+        json!(if viewer.paste_confirm {
+            "Confirm paste"
+        } else {
+            "Paste"
+        }),
+    );
 }
 
 fn settings(viewer: &Viewer, out: &mut Map<String, Value>, controls: &mut Vec<Value>) {
@@ -1206,17 +1244,24 @@ mod tests {
     }
 
     #[test]
-    fn controls_tab_shows_each_hotkey_with_its_override() {
+    fn controls_tab_routes_placement_and_layer_actions() {
         let mut viewer = crate::tests::reference_viewer();
-        crate::hotkeys::edit(&mut viewer.options.hotkeys, 0, "M+X");
         viewer.browser_event(Tab::Controls.id(), 1.);
         let mut out = Map::new();
         bindings(&viewer, &mut out, &mut Vec::new());
         assert_eq!(out["#bw_body3"], true);
-        assert_eq!(out["#bw_tab_x"], 3. * (TAB_WIDTH + TAB_GAP));
-        assert_eq!(out["#bw_key0"], "M+X");
-        assert_eq!(out["#bw_key1"], crate::hotkeys::BINDINGS[1].2);
-        assert!(LAYOUT.contains("#bw_key11"));
+        assert_eq!(out["#bw_keys_title"], "Hologram controls");
+        for id in ["x-minus", "cw", "mirror", "mode", "next-layer", "paste"] {
+            let panel: Value = serde_json::from_str(LAYOUT).unwrap();
+            assert!(
+                panel["controls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|control| control["id"] == id),
+                "{id}"
+            );
+        }
     }
 
     #[test]
