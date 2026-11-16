@@ -5,6 +5,7 @@ wit_bindgen::generate!({
 });
 
 mod actions;
+mod browser;
 mod dashboard;
 mod hotkeys;
 mod library;
@@ -334,6 +335,10 @@ struct Viewer {
     pending_menu_open: u8,
     options: Options,
     material_page: usize,
+    /// The open tab of the P window.
+    browser_tab: browser::Tab,
+    /// Text typed into the P window's material search.
+    browser_search: String,
     material_offset: usize,
     verifier_page: usize,
     verifier_marker: Option<overlay::DrawPair>,
@@ -384,6 +389,8 @@ impl Viewer {
             pending_menu_open: 0,
             options,
             material_page: 0,
+            browser_tab: browser::Tab::default(),
+            browser_search: String::new(),
             material_offset: 0,
             verifier_page: 0,
             verifier_marker: None,
@@ -488,6 +495,34 @@ impl Viewer {
                     changed |= self.scroll_materials(-keys.wheel.signum() as isize);
                 }
             }
+            if self.screen == Screen::Browser {
+                // P types into the search field while it is being edited.
+                let editing = input::read_native_editing().unwrap_or(false);
+                if !alt && !editing && keys.keys_pressed.iter().any(|key| key == browser::KEY) {
+                    let _ = panel::close();
+                    return;
+                }
+                let mut changed = keys.wheel != 0. && self.browser_scroll(keys.wheel < 0.);
+                for event in input::read_field_events().unwrap_or_default() {
+                    if let input::FieldEvent::Change(text) | input::FieldEvent::Submit(text) = event
+                    {
+                        changed |= self.browser_search_changed(&text.id, text.value);
+                    }
+                }
+                for event in keys.events {
+                    self.browser_event(&event.id, event.value);
+                    changed = true;
+                }
+                // Loading a schematic closes the window so the guide can appear.
+                if self.request.is_some() {
+                    let _ = panel::close();
+                    return;
+                }
+                if changed {
+                    menu::refresh(self);
+                }
+                return;
+            }
             if self.screen == Screen::Control {
                 for edit in input::read_text_events().unwrap_or_default() {
                     changed |= self.edit_number(&edit.id, &edit.value);
@@ -525,11 +560,18 @@ impl Viewer {
         let gameplay = active_world && keys.gameplay;
         // Opening a panel needs focused input, not a current placement snapshot.
         // The host withholds key edges while another screen owns input.
-        if let Some(screen) = legacy.or_else(|| self.builder_hotkey(&keys, alt, gameplay)) {
+        let browser = (gameplay && !alt && keys.keys_pressed.iter().any(|key| key == browser::KEY))
+            .then_some(Screen::Browser);
+        if let Some(screen) = legacy
+            .or(browser)
+            .or_else(|| self.builder_hotkey(&keys, alt, gameplay))
+        {
             self.screen = screen;
             self.selected = None;
             self.verifier_page = 0;
             self.material_page = 0;
+            // The window's search field opens empty.
+            self.browser_search.clear();
             if menu::prepare(self) {
                 self.pending_menu_open = 4;
             }
