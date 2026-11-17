@@ -11,6 +11,15 @@ const DEFAULT_LIGHT: u32 = 0xffff0000;
 // Lowering triangle vertices to WASM host calls dominates dense mismatch tiles.
 // The verifier and material counts still track every cell.
 const MAX_TILE_MARKERS: usize = 12;
+/// Host block-grid parameter slots (`mod_api::drawing::BLOCK_GRID_*_PARAM`).
+const OUTLINE_PARAM: usize = 10;
+const WASH_PARAM: usize = 11;
+const WASH_COLOR_PARAM: usize = 12;
+/// The light blue that ghost blocks blend toward: #33B3E6, the hue Litematica uses for
+/// missing blocks.
+const GHOST_WASH: [f32; 3] = [0.2, 0.702, 0.902];
+/// How far status marker boxes extend past the block on each side.
+const MARKER_INSET: f32 = 0.0075;
 
 #[derive(Default)]
 pub struct Preview {
@@ -252,10 +261,10 @@ impl WholeGhost {
         preview: &Preview,
         schematic: &Schematic,
         dimension: i32,
-        opacity: f32,
+        lightness: f32,
     ) -> bool {
         if let Some(pair) = &mut self.pair {
-            pair.set_opacity(opacity);
+            pair.set_lightness(lightness);
             return true;
         }
         if self.failed {
@@ -304,7 +313,7 @@ impl WholeGhost {
                 dimension,
                 position: lo.into(),
             },
-            opacity,
+            lightness,
         ) {
             Ok(pair) => {
                 self.hidden = vec![false; volume];
@@ -395,10 +404,10 @@ pub(super) struct DrawPair {
 }
 
 impl DrawPair {
-    fn set_opacity(&mut self, opacity: f32) {
-        if self.placement.tint.3 != opacity {
+    fn set_lightness(&mut self, lightness: f32) {
+        if self.placement.params[WASH_PARAM] != lightness {
             let mut changed = self.placement.clone();
-            changed.tint.3 = opacity;
+            changed.params[WASH_PARAM] = lightness;
             if draw::update(self.instance, &changed).is_ok() {
                 self.placement = changed;
             }
@@ -495,7 +504,7 @@ impl Tile {
         preview: &Preview,
         schematic: &Schematic,
         dimension: i32,
-        opacity: Option<f32>,
+        lightness: Option<f32>,
         whole: bool,
     ) -> (bool, bool) {
         if let Some(pair) = &self.blocks
@@ -508,8 +517,8 @@ impl Tile {
             self.fallback = true;
             self.error = Some(format!("Texture unavailable: {}", error.detail));
         }
-        if let (Some(pair), Some(opacity)) = (&mut self.blocks, opacity) {
-            pair.set_opacity(opacity);
+        if let (Some(pair), Some(lightness)) = (&mut self.blocks, lightness) {
+            pair.set_lightness(lightness);
         }
         match terrain::read_region(self.query(), self.stamp) {
             Ok(terrain::ReadResult::Pending) => {
@@ -529,7 +538,7 @@ impl Tile {
                     preview,
                     schematic,
                     dimension,
-                    opacity.filter(|_| !self.fallback),
+                    lightness.filter(|_| !self.fallback),
                     whole,
                     region,
                 );
@@ -553,7 +562,7 @@ impl Tile {
         preview: &Preview,
         schematic: &Schematic,
         dimension: i32,
-        opacity: Option<f32>,
+        lightness: Option<f32>,
         whole: bool,
         region: terrain::Region,
     ) {
@@ -636,7 +645,7 @@ impl Tile {
                     let color = match status {
                         CellStatus::Missing | CellStatus::Unloaded if !air && !ignored => {
                             materials[id][usize::from(status == CellStatus::Unloaded) * 2] += 1;
-                            if opacity.is_some() {
+                            if lightness.is_some() {
                                 let palette_index =
                                     self.grid_palette.binary_search(&(id as u32)).unwrap();
                                 word |= palette_index as u32 + 1;
@@ -676,12 +685,12 @@ impl Tile {
             position: self.lo.into(),
         };
         if !highlights.vertices.is_empty() {
-            match create(draw::GeometrySpec::Triangles(highlights), anchor, 1.) {
+            match create(draw::GeometrySpec::Triangles(highlights), anchor, 0.) {
                 Ok(pair) => self.markers = Some(pair),
                 Err(e) => self.error = Some(format!("Overlay: {}", e.detail)),
             }
         }
-        if let Some(opacity) = opacity.filter(|_| used_texture) {
+        if let Some(lightness) = lightness.filter(|_| used_texture) {
             if let Some(pair) = &self.blocks {
                 let edits = self
                     .grid_cells
@@ -743,7 +752,7 @@ impl Tile {
                     palette,
                     cells: cells.clone(),
                 };
-                match create(draw::GeometrySpec::Blocks(grid), anchor, opacity) {
+                match create(draw::GeometrySpec::Blocks(grid), anchor, lightness) {
                     Ok(pair) => {
                         self.blocks = Some(pair);
                         self.grid_cells = cells;
@@ -923,20 +932,22 @@ fn position([x, y, z]: [i32; 3]) -> terrain::Position {
     terrain::Position { x, y, z }
 }
 
+/// Creates one retained draw. Block grids draw opaque, like real blocks, blended toward
+/// light blue by `lightness` with voxel edge lines; other geometry uses its vertex colours.
 fn create(
     spec: draw::GeometrySpec,
     anchor: draw::BlockAnchor,
-    opacity: f32,
+    lightness: f32,
 ) -> Result<DrawPair, draw::DrawError> {
     let textured = matches!(&spec, draw::GeometrySpec::Blocks(_));
     let geometry = draw::create_geometry(&spec)?;
     let mut params = vec![0.; 16];
-    params[7] = 1.;
-    params[9] = 1.;
     if textured {
-        params[10] = 1.;
+        params[OUTLINE_PARAM] = 1.;
+        params[WASH_PARAM] = lightness;
+        params[WASH_COLOR_PARAM..WASH_COLOR_PARAM + 3].copy_from_slice(&GHOST_WASH);
     }
-    let mut placement = draw::Instance {
+    let placement = draw::Instance {
         geometry,
         material: None,
         clip: None,
@@ -947,11 +958,7 @@ fn create(
             rotation: (0., 0., 0., 1.),
             scale: (1., 1., 1.),
         },
-        tint: if textured {
-            (0.24, 0.74, 1., opacity)
-        } else {
-            (1., 1., 1., opacity)
-        },
+        tint: (1., 1., 1., 1.),
         depth: draw::Depth::Test,
         blend: draw::Blend::Premultiplied,
         width: 1.,
@@ -959,23 +966,7 @@ fn create(
         join: draw::Join::Bevel,
         cap: draw::Cap::Butt,
     };
-    let instance = match draw::create(&placement) {
-        Err(error) if textured && error.code == draw::ErrorCode::Invalid => {
-            // Stock Cinnabar accepts native block grids only at full opacity.
-            placement.tint = (1., 1., 1., opacity);
-            if let Ok(instance) = draw::create(&placement) {
-                return Ok(DrawPair {
-                    geometry,
-                    instance,
-                    placement,
-                });
-            }
-            placement.tint.3 = 1.;
-            draw::create(&placement)
-        }
-        result => result,
-    };
-    match instance {
+    match draw::create(&placement) {
         Ok(instance) => Ok(DrawPair {
             geometry,
             instance,
@@ -990,7 +981,7 @@ fn create(
 
 fn add_box(mesh: &mut draw::Mesh, [x, y, z]: [i32; 3], color: (f32, f32, f32, f32)) {
     let base = mesh.vertices.len() as u32;
-    let extent = [-0.015, 1.015];
+    let extent = [-MARKER_INSET, 1. + MARKER_INSET];
     for dz in extent {
         for dy in extent {
             for dx in extent {
