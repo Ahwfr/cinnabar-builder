@@ -3,8 +3,9 @@ use schematica_core::{Placement, Schematic, StateValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-const EDGE: i32 = 16;
-const FRAGMENT: usize = 1400;
+const EDGE: i32 = 8;
+// Stock BDS accepts 440-byte script commands and disconnects on larger payloads.
+const FRAGMENT: usize = 399;
 const PREFIX: &str = "/scriptevent cinnamatica:structure";
 
 pub(super) struct StructurePaste {
