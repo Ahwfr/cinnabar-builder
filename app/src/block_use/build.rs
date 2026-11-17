@@ -270,6 +270,25 @@ fn prepare(
                 |placement| placement.position,
             )
         });
+        if attempt.expected.is_none()
+            && context.creative.as_ref().is_some_and(|policy| policy.locked)
+            && local_use != LocalUse::Interact
+            && (placed_block.is_some() || local_use == LocalUse::Place)
+        {
+            // Validate the actual destination and material without requiring a
+            // particular neighbor-derived state for ordinary placement.
+            let block = placement.as_ref().map(|placed| placed.block)
+                .or_else(|| planted.map(|(_, block)| block))
+                .or_else(|| (local_use == LocalUse::Place).then_some(placed_block).flatten());
+            let mode = stream.network_id_mode();
+            let admitted = context.creative.as_ref().and_then(|policy| policy.offer.as_ref());
+            if !block.zip(admitted).is_some_and(|(block, offer)| {
+                destination == offer.position
+                    && context.collisions.block_identifier(mode, block) == Some(offer.name.as_str())
+            }) {
+                return None;
+            }
+        }
         let predicted = placement
             .filter(|_| local_use == LocalUse::Place)
             .map(|placement| {
