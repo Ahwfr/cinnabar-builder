@@ -5,7 +5,7 @@ fn fixture() -> (App, bevy::render::view::RetainedViewEntity) {
     let (mut app, (view, id), mut placement, resources) = super::super::tests::placement_fixture();
     let device = app.world().resource::<RenderDevice>();
     let ledger = mod_render::GpuLedger::new(1024);
-    placement.order = Some(Order {
+    placement.order = Some(Arc::new(Order {
         _buffer: ledger
             .allocate(16, || {
                 Some(device.create_buffer(&BufferDescriptor {
@@ -20,10 +20,11 @@ fn fixture() -> (App, bevy::render::view::RetainedViewEntity) {
         groups: (0..2)
             .map(|z| (SubChunkKey::new(0, 0, 0, z), z as u32..z as u32 + 1))
             .collect(),
-    });
+    }));
     // A previous pose must not determine the current phase distance.
     placement.matrix = Mat4::from_translation(Vec3::new(0., 0., 100.));
     let mut resources = (*resources).clone();
+    let grid = resources.instances[&id].geometry;
     resources.connection = 1;
     resources
         .instances
@@ -69,6 +70,7 @@ fn fixture() -> (App, bevy::render::view::RetainedViewEntity) {
             ..default()
         })
         .insert_resource(Blocks {
+            native: BTreeMap::from([(grid, Arc::clone(&placement.native))]),
             placements: BTreeMap::from([((view, id), placement)]),
             ..default()
         })
@@ -130,4 +132,18 @@ fn retained_depth_always_transparency_stays_out_of_the_world_depth_sort() {
     }
     app.update();
     assert!(app.world().resource::<Blocks>().draws.is_empty());
+}
+
+#[test]
+fn resident_transparency_is_queued_while_its_replacement_is_pending() {
+    let (mut app, _) = fixture();
+    let (pending, grid, _, _) = super::super::tests::grid_scene();
+    let mut scene = app.world_mut().resource_mut::<ModRenderScene>();
+    let resources = Arc::make_mut(&mut scene.retained[0]);
+    let handle = resources.instances.values().next().unwrap().geometry;
+    resources
+        .geometry
+        .insert(handle, Arc::clone(&pending.snapshot().geometry[&grid]));
+    app.update();
+    assert_eq!(app.world().resource::<Blocks>().draws.len(), 2);
 }
