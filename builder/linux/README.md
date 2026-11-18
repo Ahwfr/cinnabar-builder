@@ -4,7 +4,9 @@ ThsSilentKnight contributed the Linux build and launch scripts, the schematic pi
 
 ## Download
 
-Download `Cinnamatica-<version>-x86_64.AppImage` from [Cinnamatica Releases](https://github.com/Ahwfr/cinnamatica/releases), then make it executable and run it:
+**Incomplete:** no AppImage has been published yet. The **Cinnamatica Linux** workflow is disabled because GitHub never started its runs in this repository, so the packed image is untested. The staged AppDir passed a local launch test. Until a release carries the AppImage, build from source below.
+
+Once published, download `Cinnamatica-<version>-x86_64.AppImage` from [Cinnamatica Releases](https://github.com/Ahwfr/cinnamatica/releases), then make it executable and run it:
 
     chmod +x Cinnamatica-*-x86_64.AppImage
     ./Cinnamatica-*-x86_64.AppImage
